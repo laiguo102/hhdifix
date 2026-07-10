@@ -1,341 +1,333 @@
+"""Two-view, single-step Difix model for rain removal."""
+
+from __future__ import annotations
+
 import os
-import requests
-import sys
-import numpy as np
-from PIL import Image
-from tqdm import tqdm
+from pathlib import Path
+from typing import Any, Dict, Optional
+
 import torch
-from torchvision import transforms
-from transformers import AutoTokenizer, CLIPTextModel
-from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler
-from peft import LoraConfig
-p = "src/"
-sys.path.append(p)
+from diffusers import AutoencoderKL, DDPMScheduler
 from einops import rearrange, repeat
-import torchvision.transforms.functional as F
-
-global nn_
-nn_ = 0
-
-def make_1step_sched():
-    noise_scheduler_1step = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
-    noise_scheduler_1step.set_timesteps(1, device="cuda")
-    noise_scheduler_1step.alphas_cumprod = noise_scheduler_1step.alphas_cumprod.cuda()
-    return noise_scheduler_1step
+from peft import LoraConfig
+from PIL import Image
+from torchvision.transforms import functional as TF
+from transformers import AutoTokenizer, CLIPTextModel
 
 
-def my_vae_encoder_fwd(self, sample):
-    sample = self.conv_in(sample)
-    l_blocks = []
-    # down
-    for down_block in self.down_blocks:
-        l_blocks.append(sample)
-        sample = down_block(sample)
-    # middle
-    sample = self.mid_block(sample)
-    sample = self.conv_norm_out(sample)
-    sample = self.conv_act(sample)
-    sample = self.conv_out(sample)
-    self.current_down_blocks = l_blocks
-    return sample
+BASE_MODEL = "stabilityai/sd-turbo"
+DEFAULT_PROMPT = "remove rain streaks and restore a clean natural image"
+CHECKPOINT_SCHEMA_VERSION = 2
+UNET_LORA_TARGETS = [
+    "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2",
+    "conv_shortcut", "conv_out", "proj_in", "proj_out", "ff.net.2",
+    "ff.net.0.proj",
+]
+VAE_DECODER_LORA_SUFFIXES = [
+    "conv1", "conv2", "conv_in", "conv_shortcut", "conv", "conv_out",
+    "to_k", "to_q", "to_v", "to_out.0",
+]
 
 
-def my_vae_decoder_fwd(self, sample, latent_embeds=None):
-    sample = self.conv_in(sample)
-    upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
-    # middle
-    sample = self.mid_block(sample, latent_embeds)
-    sample = sample.to(upscale_dtype)
-    if not self.ignore_skip:
-        skip_convs = [self.skip_conv_1, self.skip_conv_2, self.skip_conv_3, self.skip_conv_4]
-        # up
-        for idx, up_block in enumerate(self.up_blocks):
-            skip_in = skip_convs[idx](self.incoming_skip_acts[::-1][idx] * self.gamma)
-            # add skip
-            sample = sample + skip_in
-            sample = up_block(sample, latent_embeds)
-    else:
-        for idx, up_block in enumerate(self.up_blocks):
-            sample = up_block(sample, latent_embeds)
-    # post-process
-    if latent_embeds is None:
-        sample = self.conv_norm_out(sample)
-    else:
-        sample = self.conv_norm_out(sample, latent_embeds)
-    sample = self.conv_act(sample)
-    sample = self.conv_out(sample)
-    return sample
+def _lora_state(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in module.state_dict().items() if "lora_" in k}
 
 
-def download_url(url, outf):
-    if not os.path.exists(outf):
-        print(f"Downloading checkpoint to {outf}")
-        response = requests.get(url, stream=True)
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
-        block_size = 1024  # 1 Kibibyte
-        progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
-        with open(outf, 'wb') as file:
-            for data in response.iter_content(block_size):
-                progress_bar.update(len(data))
-                file.write(data)
-        progress_bar.close()
-        if total_size_in_bytes != 0 and progress_bar.n != total_size_in_bytes:
-            print("ERROR, something went wrong")
-        print(f"Downloaded successfully to {outf}")
-    else:
-        print(f"Skipping download, {outf} already exists")
-
-
-def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path):
-    sd = torch.load(pretrained_path, map_location="cpu")
-    
-    if "state_dict_vae" in sd:
-        _sd_vae = net_difix.vae.state_dict()
-        for k in sd["state_dict_vae"]:
-            _sd_vae[k] = sd["state_dict_vae"][k]
-        net_difix.vae.load_state_dict(_sd_vae)
-    _sd_unet = net_difix.unet.state_dict()
-    for k in sd["state_dict_unet"]:
-        _sd_unet[k] = sd["state_dict_unet"][k]
-    net_difix.unet.load_state_dict(_sd_unet)
-        
-    optimizer.load_state_dict(sd["optimizer"])
-    
-    return net_difix, optimizer
-
-def load_ckpt_from_state_dict_noopt(net_difix, pretrained_path):
-    sd = torch.load(pretrained_path, map_location="cpu")
-    
-    if "state_dict_vae" in sd:
-        _sd_vae = net_difix.vae.state_dict()
-        for k in sd["state_dict_vae"]:
-            _sd_vae[k] = sd["state_dict_vae"][k]
-        net_difix.vae.load_state_dict(_sd_vae)
-    _sd_unet = net_difix.unet.state_dict()
-    for k in sd["state_dict_unet"]:
-        _sd_unet[k] = sd["state_dict_unet"][k]
-    net_difix.unet.load_state_dict(_sd_unet)
-    return net_difix
-
-
-def save_ckpt(net_difix, optimizer, outf):
-    sd = {}
-    sd["vae_lora_target_modules"] = net_difix.target_modules_vae
-    sd["rank_vae"] = net_difix.lora_rank_vae
-    sd["state_dict_unet"] = net_difix.unet.state_dict()
-    sd["state_dict_vae"] = {k: v for k, v in net_difix.vae.state_dict().items() if "lora" in k or "skip" in k}
-    
-    sd["optimizer"] = optimizer.state_dict()   
-    
-    torch.save(sd, outf)
+def _load_lora_state(module: torch.nn.Module, state: Dict[str, torch.Tensor]) -> None:
+    current = module.state_dict()
+    unknown = sorted(set(state) - set(current))
+    if unknown:
+        raise ValueError(f"Checkpoint contains unknown LoRA parameters: {unknown[:5]}")
+    current.update(state)
+    module.load_state_dict(current)
 
 
 class Difix(torch.nn.Module):
-    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999):
+    num_views = 2
+
+    def __init__(
+        self,
+        base_model: str = BASE_MODEL,
+        lora_rank_unet: int = 16,
+        lora_rank_vae: int = 4,
+        timestep: int = 199,
+        prompt: str = DEFAULT_PROMPT,
+        cfg_scale: float = 1.0,
+    ) -> None:
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
-        self.sched = make_1step_sched()
-
-        vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
-        vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
-        vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
-        # add the skip connection convs
-        vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.ignore_skip = True #False
-        
-        if mv_unet:
+        self.base_model = base_model
+        self.lora_rank_unet = lora_rank_unet
+        self.lora_rank_vae = lora_rank_vae
+        self.prompt = prompt
+        self.cfg_scale = cfg_scale
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
+        self.vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae")
+        try:
             from mv_unet import UNet2DConditionModel
-        else:
-            from diffusers import UNet2DConditionModel
+        except ImportError:  # package-style imports used by tests and notebooks
+            from .mv_unet import UNet2DConditionModel
+        self.unet = UNet2DConditionModel.from_pretrained(base_model, subfolder="unet")
+        self.scheduler = DDPMScheduler.from_pretrained(base_model, subfolder="scheduler")
+        self.scheduler.set_timesteps(1)
+        self.register_buffer("fixed_timestep", torch.tensor([timestep], dtype=torch.long), persistent=False)
 
-        unet = UNet2DConditionModel.from_pretrained("stabilityai/sd-turbo", subfolder="unet")
-
-        if pretrained_path is not None:
-            sd = torch.load(pretrained_path, map_location="cpu")
-            vae_lora_config = LoraConfig(r=lora_rank_vae, init_lora_weights="gaussian", target_modules=sd["vae_lora_target_modules"])
-            vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
-            self.lora_rank_vae = lora_rank_vae
-            self.target_modules_vae = sd["vae_lora_target_modules"]
-            #################unet lora
-            target_modules_unet = [
-            "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2", "conv_shortcut", "conv_out",
-            "proj_in", "proj_out", "ff.net.2", "ff.net.0.proj"
-            ]
-            lora_rank_unet = 16
-            unet_lora_config = LoraConfig(r=lora_rank_unet, init_lora_weights="gaussian",
-                target_modules=target_modules_unet
-            )
-            unet.add_adapter(unet_lora_config)
-            self.lora_rank_unet = lora_rank_unet
-            self.target_modules_vae = target_modules_unet
-            ############################
-
-            _sd_vae = vae.state_dict()
-            for k in sd["state_dict_vae"]:
-                _sd_vae[k] = sd["state_dict_vae"][k]
-            vae.load_state_dict(_sd_vae)
-            _sd_unet = unet.state_dict()
-            for k in sd["state_dict_unet"]:
-                _sd_unet[k] = sd["state_dict_unet"][k]
-            unet.load_state_dict(_sd_unet)
-
-        elif pretrained_name is None and pretrained_path is None:
-            print("Initializing model with random weights")
-            target_modules_vae = []
-
-            torch.nn.init.constant_(vae.decoder.skip_conv_1.weight, 1e-5)
-            torch.nn.init.constant_(vae.decoder.skip_conv_2.weight, 1e-5)
-            torch.nn.init.constant_(vae.decoder.skip_conv_3.weight, 1e-5)
-            torch.nn.init.constant_(vae.decoder.skip_conv_4.weight, 1e-5)
-            target_modules_vae = ["conv1", "conv2", "conv_in", "conv_shortcut", "conv", "conv_out",
-                "skip_conv_1", "skip_conv_2", "skip_conv_3", "skip_conv_4",
-                "to_k", "to_q", "to_v", "to_out.0",
-            ]
-            
-            target_modules = []
-            for id, (name, param) in enumerate(vae.named_modules()):
-                if 'decoder' in name and any(name.endswith(x) for x in target_modules_vae):
-                    target_modules.append(name)
-            target_modules_vae = target_modules
-            vae.encoder.requires_grad_(False)
-
-            #################unet lora
-            target_modules_unet = [
-            "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2", "conv_shortcut", "conv_out",
-            "proj_in", "proj_out", "ff.net.2", "ff.net.0.proj"
-            ]
-            lora_rank_unet = 16
-            unet_lora_config = LoraConfig(r=lora_rank_unet, init_lora_weights="gaussian",
-                target_modules=target_modules_unet
-            )
-            unet.add_adapter(unet_lora_config)
-            ############################
-
-
-            vae_lora_config = LoraConfig(r=lora_rank_vae, init_lora_weights="gaussian",
-                target_modules=target_modules_vae)
-            vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
-                
-            self.lora_rank_vae = lora_rank_vae
-            self.target_modules_vae = target_modules_vae
-
-            ##############
-            self.lora_rank_unet = lora_rank_unet
-            self.target_modules_vae = target_modules_unet
-            ##############
-
-        # unet.enable_xformers_memory_efficient_attention()
-        unet.to("cuda")
-        vae.to("cuda")
-
-        self.unet, self.vae = unet, vae
-        self.vae.decoder.gamma = 1
-        self.timesteps = torch.tensor([timestep], device="cuda").long()
-        self.text_encoder.requires_grad_(False)
-
-        # print number of trainable parameters
-        print("="*50)
-        print(f"Number of trainable parameters in UNet: {sum(p.numel() for p in unet.parameters() if p.requires_grad) / 1e6:.2f}M")
-        print(f"Number of trainable parameters in VAE: {sum(p.numel() for p in vae.parameters() if p.requires_grad) / 1e6:.2f}M")
-        print("="*50)
-
-    def set_eval(self):
-        self.unet.eval()
-        self.vae.eval()
         self.unet.requires_grad_(False)
         self.vae.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
 
-    def set_train(self):
+        self.target_modules_unet = list(UNET_LORA_TARGETS)
+        unet_config = LoraConfig(
+            r=lora_rank_unet,
+            init_lora_weights="gaussian",
+            target_modules=self.target_modules_unet,
+        )
+        self.unet.add_adapter(unet_config, adapter_name="unet_derain")
+
+        self.target_modules_vae = [
+            name for name, _module in self.vae.named_modules()
+            if name.startswith("decoder.") and any(name.endswith(suffix) for suffix in VAE_DECODER_LORA_SUFFIXES)
+        ]
+        if not self.target_modules_vae:
+            raise RuntimeError("No VAE decoder modules matched the LoRA target list")
+        vae_config = LoraConfig(
+            r=lora_rank_vae,
+            init_lora_weights="gaussian",
+            target_modules=self.target_modules_vae,
+        )
+        self.vae.add_adapter(vae_config, adapter_name="vae_decoder")
+        self.set_stage("A")
+
+    @property
+    def timestep(self) -> int:
+        return int(self.fixed_timestep.item())
+
+    def set_stage(self, stage: str) -> None:
+        if stage not in {"A", "B"}:
+            raise ValueError(f"stage must be 'A' or 'B', got {stage}")
+        self.stage = stage
+        self.training = True
         self.unet.train()
-        self.vae.train()
-        self.unet.requires_grad_(True)
+        self.vae.eval()
+        if stage == "B":
+            self.vae.decoder.train()
+        self.text_encoder.eval()
+        for name, parameter in self.unet.named_parameters():
+            parameter.requires_grad_("lora_" in name)
+        for name, parameter in self.vae.named_parameters():
+            parameter.requires_grad_(stage == "B" and "lora_" in name and "decoder" in name)
+        self.text_encoder.requires_grad_(False)
 
-        for n, _p in self.vae.named_parameters():
-            if "lora" in n:
-                _p.requires_grad = True
-        self.vae.decoder.skip_conv_1.requires_grad_(True)
-        self.vae.decoder.skip_conv_2.requires_grad_(True)
-        self.vae.decoder.skip_conv_3.requires_grad_(True)
-        self.vae.decoder.skip_conv_4.requires_grad_(True)
+    def trainable_parameter_groups(self, unet_lr: float, vae_lr: float):
+        unet = [p for p in self.unet.parameters() if p.requires_grad]
+        vae = [p for p in self.vae.parameters() if p.requires_grad]
+        groups = [{"params": unet, "lr": unet_lr, "name": "unet_lora"}]
+        if vae:
+            groups.append({"params": vae, "lr": vae_lr, "name": "vae_decoder_lora"})
+        if not unet or any(not p.requires_grad for group in groups for p in group["params"]):
+            raise RuntimeError("Optimizer groups must contain only trainable LoRA parameters")
+        return groups
 
-    def forward(self, x, timesteps=None, prompt=None, prompt_tokens=None, cfg_scale=1.0):
-        # either the prompt or the prompt_tokens should be provided
-        assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
-        assert (timesteps is None) != (self.timesteps is None), "Either timesteps or self.timesteps should be provided"
-        assert cfg_scale >= 0.0, "cfg_scale should be >= 0.0"
-        
-        if prompt is not None:
-            # encode the text prompt
-            caption_tokens = self.tokenizer(prompt, max_length=self.tokenizer.model_max_length,
-                                            padding="max_length", truncation=True, return_tensors="pt").input_ids.cuda()
-            caption_enc = self.text_encoder(caption_tokens)[0]
-            uncond_tokens = self.tokenizer("", max_length=self.tokenizer.model_max_length,
-                                           padding="max_length", truncation=True, return_tensors="pt").input_ids.cuda()
-            uncond_enc = self.text_encoder(uncond_tokens)[0]
-        else:
-            caption_enc = self.text_encoder(prompt_tokens)[0]
-            uncond_tokens = torch.zeros_like(prompt_tokens)
-            uncond_enc = self.text_encoder(uncond_tokens)[0]
-                                
-        num_views = x.shape[1]
-        x = rearrange(x, 'b v c h w -> (b v) c h w')
-        z = self.vae.encode(x).latent_dist.sample() * self.vae.config.scaling_factor 
-        caption_enc = repeat(caption_enc, 'b n c -> (b v) n c', v=num_views)
-        uncond_enc = repeat(uncond_enc, 'b n c -> (b v) n c', v=num_views)
-        
-        unet_input = z
-        
+    def trainable_vae_lora_parameters(self):
+        return [
+            parameter for name, parameter in self.vae.named_parameters()
+            if parameter.requires_grad and "lora_" in name and "decoder" in name
+        ]
+
+    def _prompt_embeddings(self, prompt_tokens: torch.Tensor, views: int):
+        embeddings = self.text_encoder(prompt_tokens)[0]
+        return repeat(embeddings, "b n c -> (b v) n c", v=views)
+
+    def forward(
+        self,
+        conditioning_pixel_values: torch.Tensor,
+        prompt_tokens: torch.Tensor,
+        cfg_scale: float = 1.0,
+        empty_prompt_tokens: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        if conditioning_pixel_values.ndim != 5 or conditioning_pixel_values.shape[1:] != (2, 3, 512, 512):
+            raise ValueError(
+                "conditioning_pixel_values must have shape [B,2,3,512,512], got "
+                f"{tuple(conditioning_pixel_values.shape)}"
+            )
+        if cfg_scale < 0:
+            raise ValueError("cfg_scale must be non-negative")
+
+        batch, views = conditioning_pixel_values.shape[:2]
+        pixels = rearrange(conditioning_pixel_values, "b v c h w -> (b v) c h w")
+        posterior = self.vae.encode(pixels).latent_dist
+        latents = posterior.mode() if deterministic else posterior.sample()
+        latents = latents * self.vae.config.scaling_factor
+        # Scheduler tensors are not registered model buffers, so keep them on the
+        # same device explicitly after Accelerate/model.to() moves the network.
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(latents.device)
+        self.scheduler.one = self.scheduler.one.to(latents.device)
+        prompt_embeddings = self._prompt_embeddings(prompt_tokens, views)
+        timestep = self.fixed_timestep.to(latents.device)
+
+        conditional = self.unet(latents, timestep, encoder_hidden_states=prompt_embeddings).sample
         if cfg_scale == 1.0:
-            model_pred = self.unet(unet_input, self.timesteps, encoder_hidden_states=caption_enc,).sample
+            prediction = conditional
         else:
-            model_pred_cond = self.unet(unet_input, self.timesteps, encoder_hidden_states=caption_enc,).sample
-            model_pred_uncond = self.unet(unet_input, self.timesteps, encoder_hidden_states=uncond_enc,).sample
-            model_pred = model_pred_uncond + cfg_scale * (model_pred_cond - model_pred_uncond)
-        z_denoised = self.sched.step(model_pred, self.timesteps, z, return_dict=True).prev_sample
-        self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
-        output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
-        output_image = rearrange(output_image, '(b v) c h w -> b v c h w', v=num_views)
-        
-        return output_image
-    
-    def sample(self, image, width, height, ref_image=None, timesteps=None, prompt=None, prompt_tokens=None, cfg_scale=1.0):
-        input_width, input_height = image.size
-        new_width = image.width - image.width % 8
-        new_height = image.height - image.height % 8
-        #image = image.resize((new_width, new_height), Image.LANCZOS)
-        image = image.resize((128, 128))
-        image = image.resize((512, 512))
-        
-        T = transforms.Compose([
-            transforms.Resize((height, width), interpolation=Image.LANCZOS),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ])
-        if ref_image is None:
-            x = T(image).unsqueeze(0).unsqueeze(0).cuda()
-        else:
-            ref_image = ref_image.resize((new_width, new_height), Image.LANCZOS)
-            x = torch.stack([T(image), T(ref_image)], dim=0).unsqueeze(0).cuda()
-        
-        output_image = self.forward(x, timesteps, prompt, prompt_tokens, cfg_scale=cfg_scale)[:, 0]
-        output_pil = transforms.ToPILImage()(output_image[0].cpu() * 0.5 + 0.5)
-        #output_pil = output_pil.resize((input_width, input_height), Image.LANCZOS)
-        
-        return output_pil
+            if empty_prompt_tokens is None:
+                raise ValueError("empty_prompt_tokens are required when cfg_scale != 1.0")
+            empty_embeddings = self._prompt_embeddings(empty_prompt_tokens, views)
+            unconditional = self.unet(latents, timestep, encoder_hidden_states=empty_embeddings).sample
+            prediction = unconditional + cfg_scale * (conditional - unconditional)
 
-    def save_model(self, outf, optimizer):
-        sd = {}
-        sd["unet_lora_target_modules"] = self.target_modules_unet
-        sd["rank_unet"] = self.lora_rank_unet
-        sd["vae_lora_target_modules"] = self.target_modules_vae
-        sd["rank_vae"] = self.lora_rank_vae
-        sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
-        sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
-        
-        sd["optimizer"] = optimizer.state_dict()
-        
-        torch.save(sd, outf)
+        denoised = self.scheduler.step(prediction, timestep, latents, return_dict=True).prev_sample
+        decoded = self.vae.decode(denoised / self.vae.config.scaling_factor).sample.clamp(-1, 1)
+        return rearrange(decoded, "(b v) c h w -> b v c h w", b=batch, v=views)
+
+    @torch.no_grad()
+    def sample(
+        self,
+        rainy: Image.Image,
+        preliminary: Image.Image,
+        prompt: Optional[str] = None,
+        cfg_scale: Optional[float] = None,
+    ) -> Image.Image:
+        if rainy.mode != "RGB" or preliminary.mode != "RGB":
+            raise ValueError("Rainy and preliminary images must both be RGB")
+        if rainy.size != preliminary.size:
+            raise ValueError(f"Rainy/reference sizes differ: {rainy.size} vs {preliminary.size}")
+        if rainy.size != (512, 512):
+            raise ValueError(f"Rainy/reference images must be 512x512, got {rainy.size}")
+        prompt = self.prompt if prompt is None else prompt
+        cfg_scale = self.cfg_scale if cfg_scale is None else cfg_scale
+        device = next(self.parameters()).device
+        tokens = self.tokenizer(
+            prompt, max_length=self.tokenizer.model_max_length, padding="max_length",
+            truncation=True, return_tensors="pt",
+        ).input_ids.to(device)
+        pixels = torch.stack((TF.to_tensor(rainy), TF.to_tensor(preliminary)))
+        pixels = pixels.mul(2).sub(1).unsqueeze(0).to(device)
+        empty_tokens = None
+        if cfg_scale != 1.0:
+            empty_tokens = self.tokenizer(
+                "", max_length=self.tokenizer.model_max_length, padding="max_length",
+                truncation=True, return_tensors="pt",
+            ).input_ids.to(device)
+        output = self.forward(
+            pixels, tokens, cfg_scale=cfg_scale,
+            empty_prompt_tokens=empty_tokens, deterministic=True,
+        )[:, 0]
+        return TF.to_pil_image(output[0].float().cpu().add(1).div(2).clamp(0, 1))
+
+    def checkpoint_config(self) -> Dict[str, Any]:
+        return {
+            "base_model": self.base_model,
+            "num_views": self.num_views,
+            "lora_rank_unet": self.lora_rank_unet,
+            "lora_rank_vae": self.lora_rank_vae,
+            "timestep": self.timestep,
+            "prompt": self.prompt,
+            "cfg_scale": self.cfg_scale,
+            "stage": self.stage,
+        }
+
+
+def save_checkpoint(
+    path: str | Path,
+    model: Difix,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler,
+    global_step: int,
+    training_state: Optional[Dict[str, Any]] = None,
+    checkpoint_kind: str = "training",
+) -> None:
+    if checkpoint_kind not in {"training", "weights"}:
+        raise ValueError(f"Unsupported checkpoint kind: {checkpoint_kind}")
+    if checkpoint_kind == "training" and (optimizer is None or scheduler is None):
+        raise ValueError("Training checkpoints require optimizer and scheduler state")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "global_step": int(global_step),
+        "stage": model.stage,
+        "stage_step": 0,
+        "optimizer_groups": [group.get("name", f"group_{index}") for index, group in enumerate(optimizer.param_groups)] if optimizer else [],
+    }
+    if training_state:
+        state.update(training_state)
+    if state["global_step"] != int(global_step):
+        raise ValueError("training_state global_step differs from save_checkpoint global_step")
+    if state["stage"] != model.stage:
+        raise ValueError("training_state stage differs from model.stage")
+    payload = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_kind": checkpoint_kind,
+        "config": model.checkpoint_config(),
+        "training_state": state,
+        "unet_lora": _lora_state(model.unet),
+        "vae_decoder_lora": _lora_state(model.vae),
+    }
+    if checkpoint_kind == "training":
+        payload["optimizer"] = optimizer.state_dict()
+        payload["scheduler"] = scheduler.state_dict()
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def read_checkpoint_metadata(path: str | Path) -> Dict[str, Any]:
+    checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported checkpoint schema {checkpoint.get('schema_version')}; "
+            f"expected {CHECKPOINT_SCHEMA_VERSION}"
+        )
+    return {
+        "checkpoint_kind": checkpoint["checkpoint_kind"],
+        "config": checkpoint["config"],
+        "training_state": checkpoint["training_state"],
+    }
+
+
+def load_checkpoint(
+    path: str | Path,
+    model: Difix,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler=None,
+) -> Dict[str, Any]:
+    checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("Only checkpoint schema v2 is supported")
+    config = checkpoint["config"]
+    expected = model.checkpoint_config()
+    for key in ("base_model", "num_views", "lora_rank_unet", "lora_rank_vae", "timestep", "prompt", "cfg_scale"):
+        if config[key] != expected[key]:
+            raise ValueError(f"Checkpoint {key}={config[key]!r}, model expects {expected[key]!r}")
+    model.set_stage(config.get("stage", "A"))
+    _load_lora_state(model.unet, checkpoint["unet_lora"])
+    _load_lora_state(model.vae, checkpoint["vae_decoder_lora"])
+    if optimizer is not None:
+        if checkpoint["checkpoint_kind"] != "training":
+            raise ValueError("A weights-only checkpoint cannot resume optimizer state")
+        expected_groups = checkpoint["training_state"]["optimizer_groups"]
+        actual_groups = [group.get("name", f"group_{index}") for index, group in enumerate(optimizer.param_groups)]
+        if actual_groups != expected_groups:
+            raise ValueError(f"Optimizer groups differ: checkpoint={expected_groups}, model={actual_groups}")
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    if scheduler is not None:
+        if checkpoint["checkpoint_kind"] != "training":
+            raise ValueError("A weights-only checkpoint cannot resume scheduler state")
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    return checkpoint["training_state"]
+
+
+def model_from_checkpoint(path: str | Path, device: torch.device | str = "cuda") -> Difix:
+    checkpoint = torch.load(path, map_location="cpu")
+    config = checkpoint["config"]
+    model = Difix(
+        base_model=config["base_model"],
+        lora_rank_unet=config["lora_rank_unet"],
+        lora_rank_vae=config["lora_rank_vae"],
+        timestep=config["timestep"],
+        prompt=config["prompt"],
+        cfg_scale=config.get("cfg_scale", 1.0),
+    )
+    load_checkpoint(path, model)
+    model.eval().requires_grad_(False)
+    return model.to(device)

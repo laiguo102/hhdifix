@@ -1,422 +1,453 @@
-import os
-import gc
-import lpips
-import random
+"""Two-stage LoRA training for two-view rain removal."""
+
+from __future__ import annotations
+
 import argparse
-import numpy as np
+import json
+from pathlib import Path
+from typing import Dict, Optional
+
+import lpips
 import torch
-import torch.nn.functional as F
-import torch.utils.checkpoint
-import torchvision
-import transformers
-from torchvision.transforms.functional import crop
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from PIL import Image
-from torchvision import transforms
-from tqdm.auto import tqdm
-from glob import glob
-from einops import rearrange
-
-import diffusers
-from diffusers.utils.import_utils import is_xformers_available
 from diffusers.optimization import get_scheduler
+from tqdm.auto import tqdm
 
-import wandb
+try:
+    from dataset import DEFAULT_PROMPT, PairedDataset
+    from loss import DerainLoss, _ssim_map
+    from model import Difix, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+except ImportError:
+    from .dataset import DEFAULT_PROMPT, PairedDataset
+    from .loss import DerainLoss, _ssim_map
+    from .model import Difix, load_checkpoint, read_checkpoint_metadata, save_checkpoint
 
-from model import Difix, load_ckpt_from_state_dict, save_ckpt
-from dataset import PairedDataset
-from loss import gram_loss
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_path", required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--base_model", default="stabilityai/sd-turbo")
+    parser.add_argument("--prompt", default=None)
+    parser.add_argument("--prompt_dropout", type=float, default=0.0)
+    parser.add_argument("--reference_dropout", type=float, default=0.2)
+    parser.add_argument("--clean_identity", type=float, default=0.1)
+    parser.add_argument("--cfg_scale", type=float, default=1.0)
+    parser.add_argument("--stage_a_steps", type=int, default=15_000)
+    parser.add_argument("--stage_b_steps", type=int, default=5_000)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--unet_lr", type=float, default=5e-5)
+    parser.add_argument("--stage_b_unet_lr", type=float, default=1e-5)
+    parser.add_argument("--vae_lr", type=float, default=1e-5)
+    parser.add_argument("--lora_rank_unet", type=int, default=16)
+    parser.add_argument("--lora_rank_vae", type=int, default=4)
+    parser.add_argument("--timestep", type=int, default=199)
+    parser.add_argument("--train_batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--dataloader_num_workers", type=int, default=4)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--checkpoints_total_limit", type=int, default=5)
+    parser.add_argument("--eval_freq", type=int, default=1000)
+    parser.add_argument("--mixed_precision", choices=["no", "fp16", "bf16"], default="bf16")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
+    parser.add_argument("--resume")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--report_to", default="none")
+    parser.add_argument("--tracker_project_name", default="hhdifix")
+    parser.add_argument("--tracker_run_name", default="derain")
+    args = parser.parse_args()
+    for name in ("prompt_dropout", "reference_dropout", "clean_identity"):
+        if not 0 <= getattr(args, name) <= 1:
+            parser.error(f"--{name} must be in [0,1]")
+    for name in ("stage_a_steps", "stage_b_steps", "checkpointing_steps", "checkpoints_total_limit"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name} must be positive")
+    if args.cfg_scale != 1.0 and args.prompt_dropout == 0:
+        parser.error("Non-default CFG requires explicit prompt dropout")
+    return args
+
+
+def resolve_prompt(dataset_path: str, cli_prompt: Optional[str]) -> str:
+    with Path(dataset_path).open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    train_prompt = config.get("train", {}).get("prompt", DEFAULT_PROMPT)
+    test_prompt = config.get("test", {}).get("prompt", DEFAULT_PROMPT)
+    if cli_prompt is not None:
+        return cli_prompt
+    if train_prompt != test_prompt:
+        raise ValueError("train/test prompts differ; pass --prompt to provide one explicit prompt")
+    return train_prompt
+
+
+def make_optimizer(model: Difix, args, stage: str):
+    model.set_stage(stage)
+    unet_lr = args.unet_lr if stage == "A" else args.stage_b_unet_lr
+    groups = model.trainable_parameter_groups(unet_lr, args.vae_lr)
+    return torch.optim.AdamW(groups, betas=(0.9, 0.999), weight_decay=1e-2, eps=1e-8)
+
+
+def make_lr_scheduler(optimizer, args, stage: str):
+    if stage == "A":
+        return get_scheduler(
+            "constant_with_warmup", optimizer=optimizer,
+            num_warmup_steps=args.warmup_steps,
+            num_training_steps=args.stage_a_steps,
+        )
+    return get_scheduler(
+        "constant", optimizer=optimizer,
+        num_warmup_steps=0, num_training_steps=args.stage_b_steps,
+    )
+
+
+def _base_optimizer(optimizer):
+    return getattr(optimizer, "optimizer", optimizer)
+
+
+def transition_to_stage_b(model: Difix, optimizer, args):
+    """Enable VAE LoRA without replacing optimizer or UNet Adam state."""
+    if model.stage != "A":
+        raise ValueError(f"Can only transition from stage A, got {model.stage}")
+    base_optimizer = _base_optimizer(optimizer)
+    if [group.get("name") for group in base_optimizer.param_groups] != ["unet_lora"]:
+        raise ValueError("Stage A optimizer must contain exactly the UNet LoRA group")
+    unet_state_ids = {id(parameter): state for parameter, state in base_optimizer.state.items()}
+    existing = {id(parameter) for group in base_optimizer.param_groups for parameter in group["params"]}
+
+    model.set_stage("B")
+    vae_parameters = model.trainable_vae_lora_parameters()
+    if not vae_parameters:
+        raise RuntimeError("No trainable VAE decoder LoRA parameters at stage-B transition")
+    if any(id(parameter) in existing for parameter in vae_parameters):
+        raise RuntimeError("VAE LoRA parameters are already present in the optimizer")
+
+    base_optimizer.param_groups[0]["lr"] = args.stage_b_unet_lr
+    base_optimizer.param_groups[0]["initial_lr"] = args.stage_b_unet_lr
+    base_optimizer.add_param_group({
+        "params": vae_parameters,
+        "lr": args.vae_lr,
+        "initial_lr": args.vae_lr,
+        "name": "vae_decoder_lora",
+    })
+    for parameter, state in base_optimizer.state.items():
+        if id(parameter) in unet_state_ids and state is not unet_state_ids[id(parameter)]:
+            raise RuntimeError("UNet optimizer state changed during stage transition")
+    return base_optimizer
+
+
+def checkpoint_to_resume(path: Optional[str]) -> Optional[Path]:
+    if not path:
+        return None
+    path = Path(path)
+    if path.is_file():
+        return path
+    if (path / "checkpoints" / "resume").is_dir():
+        search_dir = path / "checkpoints" / "resume"
+    elif (path / "resume").is_dir():
+        search_dir = path / "resume"
+    else:
+        search_dir = path
+    candidates = []
+    for candidate in search_dir.glob("checkpoint-*.pt"):
+        try:
+            step = int(candidate.stem.split("-")[-1])
+        except ValueError:
+            continue
+        candidates.append((step, candidate))
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoint-*.pt files in {search_dir}")
+    return max(candidates)[1]
+
+
+def prune_checkpoints(directory: Path, keep_last: int) -> None:
+    checkpoints = []
+    for path in directory.glob("checkpoint-*.pt"):
+        try:
+            checkpoints.append((int(path.stem.split("-")[-1]), path))
+        except ValueError:
+            continue
+    for _step, path in sorted(checkpoints)[:-keep_last]:
+        path.unlink()
+
+
+def _metric_values(prediction, target, lpips_model):
+    prediction_01 = prediction.add(1).div(2).clamp(0, 1)
+    target_01 = target.add(1).div(2).clamp(0, 1)
+    mse = (prediction_01 - target_01).pow(2).flatten(1).mean(1)
+    psnr = -10 * torch.log10(mse.clamp_min(1e-12))
+    ssim = _ssim_map(prediction_01, target_01).flatten(1).mean(1)
+    perceptual = lpips_model(prediction.float(), target.float()).flatten()
+    return psnr, ssim, perceptual
+
+
+@torch.no_grad()
+def validate(model, dataloader, criterion, accelerator):
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_criterion = accelerator.unwrap_model(criterion)
+    previous_stage = unwrapped_model.stage
+    previous_training = model.training
+    model.eval()
+    totals: Dict[str, float] = {}
+    count = 0
+    try:
+        for batch in dataloader:
+            conditioning = batch["conditioning_pixel_values"].to(accelerator.device)
+            target = batch["target_pixel_values"].to(accelerator.device)
+            tokens = batch["input_ids"].to(accelerator.device)
+            final = model(conditioning, tokens, deterministic=True)[:, 0]
+            loss, _ = criterion(final, target)
+            variants = {
+                "rainy": conditioning[:, 0],
+                "preliminary": conditioning[:, 1],
+                "final": final,
+            }
+            batch_metrics = {}
+            for name, prediction in variants.items():
+                psnr, ssim, perceptual = _metric_values(
+                    prediction, target, unwrapped_criterion.lpips_model
+                )
+                batch_metrics[name] = (psnr, ssim, perceptual)
+                for metric_name, values in zip(("psnr", "ssim", "lpips"), batch_metrics[name]):
+                    key = f"val/{name}_{metric_name}"
+                    totals[key] = totals.get(key, 0.0) + values.sum().item()
+            batch_size = target.shape[0]
+            totals["val/loss"] = totals.get("val/loss", 0.0) + loss.item() * batch_size
+            totals["val/psnr_wins"] = totals.get("val/psnr_wins", 0.0) + (
+                batch_metrics["final"][0] > batch_metrics["preliminary"][0]
+            ).sum().item()
+            totals["val/lpips_wins"] = totals.get("val/lpips_wins", 0.0) + (
+                batch_metrics["final"][2] < batch_metrics["preliminary"][2]
+            ).sum().item()
+            count += batch_size
+    finally:
+        if previous_training:
+            unwrapped_model.set_stage(previous_stage)
+        else:
+            model.eval()
+    metrics = {key: value / count for key, value in totals.items()}
+    metrics["val/delta_psnr"] = metrics["val/final_psnr"] - metrics["val/preliminary_psnr"]
+    metrics["val/delta_lpips"] = metrics["val/final_lpips"] - metrics["val/preliminary_lpips"]
+    metrics["val/psnr_win_rate"] = metrics.pop("val/psnr_wins")
+    metrics["val/lpips_win_rate"] = metrics.pop("val/lpips_wins")
+    return metrics
+
+
+def is_better(metrics: Dict[str, float], best: Optional[Dict[str, float]]) -> bool:
+    if best is None:
+        return True
+    current_key = (metrics["val/final_psnr"], -metrics["val/final_lpips"], metrics["val/final_ssim"])
+    best_key = (best["val/final_psnr"], -best["val/final_lpips"], best["val/final_ssim"])
+    return current_key > best_key
+
+
+def training_state(args, global_step: int, stage: str, best_metrics):
+    return {
+        "global_step": global_step,
+        "stage": stage,
+        "stage_step": global_step if stage == "A" else global_step - args.stage_a_steps,
+        "stage_a_steps": args.stage_a_steps,
+        "stage_b_steps": args.stage_b_steps,
+        "best_metrics": best_metrics,
+    }
 
 
 def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=None if args.report_to == "none" else args.report_to,
     )
-
-    if accelerator.is_local_main_process:
-        transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
-        transformers.utils.logging.set_verbosity_error()
-        diffusers.utils.logging.set_verbosity_error()
-
-    if args.seed is not None:
-        set_seed(args.seed)
-
+    if accelerator.num_processes != 1:
+        raise RuntimeError("Dynamic two-stage optimizer is currently supported only on one GPU")
+    set_seed(args.seed)
+    output_dir = Path(args.output_dir)
+    checkpoint_dir = output_dir / "checkpoints"
+    resume_dir = checkpoint_dir / "resume"
     if accelerator.is_main_process:
-        os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
+        resume_dir.mkdir(parents=True, exist_ok=True)
 
-    net_difix = Difix(
-        lora_rank_vae=args.lora_rank_vae, 
-        timestep=args.timestep,
-        mv_unet=args.mv_unet,
+    resolved_prompt = resolve_prompt(args.dataset_path, args.prompt)
+    resume_path = checkpoint_to_resume(args.resume)
+    metadata = read_checkpoint_metadata(resume_path) if resume_path else None
+    if metadata and metadata["checkpoint_kind"] != "training":
+        raise ValueError("--resume requires a training checkpoint, not a weights-only checkpoint")
+    if metadata and metadata["config"]["prompt"] != resolved_prompt:
+        raise ValueError("Resolved dataset/CLI prompt differs from the checkpoint prompt")
+    if metadata:
+        saved_state = metadata["training_state"]
+        for key in ("stage_a_steps", "stage_b_steps"):
+            if int(saved_state[key]) != int(getattr(args, key)):
+                raise ValueError(f"Checkpoint {key}={saved_state[key]} differs from requested {getattr(args, key)}")
+        expected_groups = ["unet_lora"] if saved_state["stage"] == "A" else ["unet_lora", "vae_decoder_lora"]
+        if saved_state["optimizer_groups"] != expected_groups:
+            raise ValueError(
+                f"Checkpoint stage/group mismatch: stage={saved_state['stage']}, "
+                f"groups={saved_state['optimizer_groups']}"
+            )
+    initial_stage = metadata["training_state"]["stage"] if metadata else "A"
+    global_step = int(metadata["training_state"]["global_step"]) if metadata else 0
+    best_metrics = metadata["training_state"].get("best_metrics") if metadata else None
+    total_steps = args.stage_a_steps + args.stage_b_steps
+
+    model = Difix(
+        args.base_model, args.lora_rank_unet, args.lora_rank_vae, args.timestep,
+        prompt=resolved_prompt, cfg_scale=args.cfg_scale,
     )
-    net_difix.set_train()
+    optimizer = make_optimizer(model, args, initial_stage)
+    lr_scheduler = make_lr_scheduler(optimizer, args, initial_stage)
+    if resume_path:
+        loaded_state = load_checkpoint(resume_path, model, optimizer, lr_scheduler)
+        global_step = int(loaded_state["global_step"])
+        best_metrics = loaded_state.get("best_metrics")
 
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            net_difix.unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available, please install it by running `pip install xformers`")
+    transitioned_on_resume = False
+    if model.stage == "A" and global_step >= args.stage_a_steps:
+        optimizer = transition_to_stage_b(model, optimizer, args)
+        lr_scheduler = make_lr_scheduler(optimizer, args, "B")
+        transitioned_on_resume = True
 
     if args.gradient_checkpointing:
-        net_difix.unet.enable_gradient_checkpointing()
+        model.unet.enable_gradient_checkpointing()
+    if args.enable_xformers_memory_efficient_attention:
+        model.unet.enable_xformers_memory_efficient_attention()
 
-    if args.allow_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-    net_lpips = lpips.LPIPS(net='vgg').cuda()
-
-    net_lpips.requires_grad_(False)
-    
-    net_vgg = torchvision.models.vgg16(pretrained=True).features
-    for param in net_vgg.parameters():
-        param.requires_grad_(False)
-
-    # make the optimizer
-    layers_to_opt = []
-    layers_to_opt += list(net_difix.unet.parameters())
-   
-    for n, _p in net_difix.vae.named_parameters():
-        if "lora" in n and "vae_skip" in n:
-            assert _p.requires_grad
-            layers_to_opt.append(_p)
-    layers_to_opt = layers_to_opt + list(net_difix.vae.decoder.skip_conv_1.parameters()) + \
-        list(net_difix.vae.decoder.skip_conv_2.parameters()) + \
-        list(net_difix.vae.decoder.skip_conv_3.parameters()) + \
-        list(net_difix.vae.decoder.skip_conv_4.parameters())
-
-    optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,)
-    lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
-        num_cycles=args.lr_num_cycles, power=args.lr_power,)
-
-    dataset_train = PairedDataset(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer)
-    dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dataset_val = PairedDataset(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer)
-    #random.Random(42).shuffle(dataset_val.img_ids)
-    dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
-
-    # Resume from checkpoint
-    global_step = 0    
-    if args.resume is not None:
-        if os.path.isdir(args.resume):
-            # Resume from last ckpt
-            ckpt_files = glob(os.path.join(args.resume, "*.pkl"))
-            assert len(ckpt_files) > 0, f"No checkpoint files found: {args.resume}"
-            ckpt_files = sorted(ckpt_files, key=lambda x: int(x.split("/")[-1].replace("model_", "").replace(".pkl", "")))
-            print("="*50); print(f"Loading checkpoint from {ckpt_files[-1]}"); print("="*50)
-            global_step = int(ckpt_files[-1].split("/")[-1].replace("model_", "").replace(".pkl", ""))
-            net_difix, optimizer = load_ckpt_from_state_dict(
-                net_difix, optimizer, ckpt_files[-1]
-            )
-        elif args.resume.endswith(".pkl"):
-            print("="*50); print(f"Loading checkpoint from {args.resume}"); print("="*50)
-            global_step = int(args.resume.split("/")[-1].replace("model_", "").replace(".pkl", ""))
-            net_difix, optimizer = load_ckpt_from_state_dict(
-                net_difix, optimizer, args.resume
-            )    
-        else:
-            raise NotImplementedError(f"Invalid resume path: {args.resume}")
-    else:
-        print("="*50); print(f"Training from scratch"); print("="*50)
-    
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    # Move al networksr to device and cast to weight_dtype
-    net_difix.to(accelerator.device, dtype=weight_dtype)
-    net_lpips.to(accelerator.device, dtype=weight_dtype)
-    net_vgg.to(accelerator.device, dtype=weight_dtype)
-    
-    # Prepare everything with our `accelerator`.
-    net_difix, optimizer, dl_train, lr_scheduler = accelerator.prepare(
-        net_difix, optimizer, dl_train, lr_scheduler
+    train_dataset = PairedDataset(
+        args.dataset_path, "train", tokenizer=model.tokenizer,
+        reference_dropout_prob=args.reference_dropout,
+        clean_identity_prob=args.clean_identity, prompt_override=resolved_prompt,
     )
-    net_lpips, net_vgg = accelerator.prepare(net_lpips, net_vgg)
-    # renorm with image net statistics
-    t_vgg_renorm =  transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        init_kwargs = {
-            "wandb": {
-                "name": args.tracker_run_name,
-                "dir": args.output_dir,
-            },
-        }        
-        tracker_config = dict(vars(args))
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
-
-    progress_bar = tqdm(range(0, args.max_train_steps), initial=global_step, desc="Steps",
-        disable=not accelerator.is_local_main_process,)
-
-    # start the training loop
-    output_dir = os.path.join(args.output_dir, "eval")
-    #os.makedirs(output_dir,exist_ok=True)
-    _tokenizer = accelerator.unwrap_model(net_difix).tokenizer
-    uncond_input_ids = _tokenizer(
-        "", max_length=_tokenizer.model_max_length,
-        padding="max_length", truncation=True, return_tensors="pt"
+    val_dataset = PairedDataset(
+        args.dataset_path, "test", tokenizer=model.tokenizer,
+        horizontal_flip_prob=0, reference_dropout_prob=0, clean_identity_prob=0,
+        prompt_override=resolved_prompt,
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.train_batch_size, shuffle=True,
+        num_workers=args.dataloader_num_workers, pin_memory=True,
+        persistent_workers=args.dataloader_num_workers > 0,
+    )
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=False)
+    criterion = DerainLoss(lpips.LPIPS(net="vgg"))
+    model, optimizer, lr_scheduler, train_loader, val_loader, criterion = accelerator.prepare(
+        model, optimizer, lr_scheduler, train_loader, val_loader, criterion
+    )
+    if args.report_to != "none":
+        accelerator.init_trackers(
+            args.tracker_project_name, config={**vars(args), "resolved_prompt": resolved_prompt},
+            init_kwargs={args.report_to: {"name": args.tracker_run_name}},
+        )
+    tokenizer = accelerator.unwrap_model(model).tokenizer
+    empty_tokens = tokenizer(
+        "", max_length=tokenizer.model_max_length,
+        padding="max_length", truncation=True, return_tensors="pt",
     ).input_ids.to(accelerator.device)
-    while 1:
-        if global_step > args.max_train_steps+10:
-            break
-        for step, batch in enumerate(dl_train):
-            if global_step > args.max_train_steps+10:
+
+    if transitioned_on_resume and accelerator.is_main_process:
+        save_checkpoint(
+            resume_dir / f"checkpoint-{global_step}.pt", accelerator.unwrap_model(model),
+            optimizer, lr_scheduler, global_step,
+            training_state(args, global_step, "B", best_metrics),
+        )
+        prune_checkpoints(resume_dir, args.checkpoints_total_limit)
+
+    progress = tqdm(total=total_steps, initial=global_step, disable=not accelerator.is_local_main_process)
+    while global_step < total_steps:
+        for batch in train_loader:
+            if global_step >= total_steps:
                 break
-            l_acc = [net_difix]
-            with accelerator.accumulate(*l_acc):
-                x_src = batch["conditioning_pixel_values"]
-                x_tgt = batch["output_pixel_values"]
-                B, V, C, H, W = x_src.shape
-
-                use_neg = torch.rand(1).item() < args.neg_prob
-                if use_neg:
-                    _uncond_ids = uncond_input_ids.expand(B, -1)
-                    x_tgt_pred = net_difix(x_src, prompt_tokens=_uncond_ids)
-                    first_frames_tgt = x_tgt[:, 1] if x_tgt.shape[1] >= 2 else x_tgt[:, 0]
-                else:
-                    x_tgt_pred = net_difix(x_src, prompt_tokens=batch["input_ids"])
-                    first_frames_tgt = x_tgt[:, 0]
-
-                first_frames_tgt_pred = x_tgt_pred[:, 0]  # [B, C, H, W] 
-
-                # x_tgt = first_frames_tgt
-                # x_tgt_pred = first_frames_tgt_pred
-                
-                x_tgt = rearrange(x_tgt, 'b v c h w -> (b v) c h w')
-                x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')              
-                         
-                # Reconstruction loss
-                # loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
-                # loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
-
-                loss_l2 = F.mse_loss(first_frames_tgt_pred.float(), first_frames_tgt.float(), reduction="mean") * args.lambda_l2
-                loss_lpips = net_lpips(first_frames_tgt_pred.float(), first_frames_tgt.float()).mean() * args.lambda_lpips
-
-
-                loss = loss_l2 + loss_lpips
-                
-                # Gram matrix loss
-                # if args.lambda_gram > 0:
-                #     if global_step > args.gram_loss_warmup_steps:
-                #         x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
-                #         crop_h, crop_w = 400, 400
-                #         top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
-                #         x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
-                        
-                #         x_tgt_renorm = t_vgg_renorm(x_tgt * 0.5 + 0.5)
-                #         x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
-                        
-                #         loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                #         loss += loss_gram
-                #     else:
-                #         loss_gram = torch.tensor(0.0).to(weight_dtype)                    
-
-                accelerator.backward(loss, retain_graph=False)
+            with accelerator.accumulate(model):
+                conditioning = batch["conditioning_pixel_values"].to(accelerator.device)
+                target = batch["target_pixel_values"].to(accelerator.device)
+                tokens = batch["input_ids"].to(accelerator.device)
+                if args.prompt_dropout > 0:
+                    drop = torch.rand(tokens.shape[0], device=tokens.device) < args.prompt_dropout
+                    tokens = tokens.clone()
+                    tokens[drop] = empty_tokens.expand(tokens.shape[0], -1)[drop]
+                prediction = model(
+                    conditioning, tokens, cfg_scale=args.cfg_scale,
+                    empty_prompt_tokens=empty_tokens.expand(tokens.shape[0], -1),
+                )[:, 0]
+                loss, terms = criterion(prediction, target)
+                accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(layers_to_opt, args.max_grad_norm)
+                    accelerator.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=args.set_grads_to_none)
-                
-                x_tgt = rearrange(x_tgt, '(b v) c h w -> b v c h w', v=V)
-                x_tgt_pred = rearrange(x_tgt_pred, '(b v) c h w -> b v c h w', v=V)
+                optimizer.zero_grad(set_to_none=True)
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
+            if not accelerator.sync_gradients:
+                continue
+            global_step += 1
+            progress.update(1)
+            logs = {"train/loss": loss.detach().item(), "train/stage": 0 if accelerator.unwrap_model(model).stage == "A" else 1}
+            logs.update({f"train/{key}": value.detach().item() for key, value in terms.items()})
+            for group in _base_optimizer(optimizer).param_groups:
+                logs[f"train/lr_{group.get('name', 'unknown')}"] = group["lr"]
+            if args.report_to != "none":
+                accelerator.log(logs, step=global_step)
 
+            metrics = None
+            if args.eval_freq > 0 and global_step % args.eval_freq == 0:
+                metrics = validate(model, val_loader, criterion, accelerator)
+                if args.report_to != "none":
+                    accelerator.log(metrics, step=global_step)
+                if is_better(metrics, best_metrics):
+                    best_metrics = {**metrics, "global_step": global_step}
+                    if accelerator.is_main_process:
+                        save_checkpoint(
+                            checkpoint_dir / "best.pt", accelerator.unwrap_model(model),
+                            None, None, global_step,
+                            training_state(args, global_step, accelerator.unwrap_model(model).stage, best_metrics),
+                            checkpoint_kind="weights",
+                        )
+
+            if global_step == args.stage_a_steps and accelerator.unwrap_model(model).stage == "A":
                 if accelerator.is_main_process:
-                    logs = {}
-                    # log all the losses
-                    logs["loss_l2"] = loss_l2.detach().item()
-                    logs["loss_lpips"] = loss_lpips.detach().item()
-                    # if args.lambda_gram > 0:
-                    #     logs["loss_gram"] = loss_gram.detach().item()
-                    progress_bar.set_postfix(**logs)
+                    save_checkpoint(
+                        checkpoint_dir / "stage-a-final.pt", accelerator.unwrap_model(model),
+                        optimizer, lr_scheduler, global_step,
+                        training_state(args, global_step, "A", best_metrics),
+                    )
+                base_optimizer = transition_to_stage_b(accelerator.unwrap_model(model), optimizer, args)
+                new_scheduler = make_lr_scheduler(base_optimizer, args, "B")
+                lr_scheduler = accelerator.prepare_scheduler(new_scheduler)
+                if accelerator.is_main_process:
+                    save_checkpoint(
+                        resume_dir / f"checkpoint-{global_step}.pt", accelerator.unwrap_model(model),
+                        optimizer, lr_scheduler, global_step,
+                        training_state(args, global_step, "B", best_metrics),
+                    )
+                    prune_checkpoints(resume_dir, args.checkpoints_total_limit)
+                continue
 
-                    # # viz some images
-                    # if global_step % args.viz_freq == 1:
-                    #     log_dict = {
-                    #         "train/source": [wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                    #         "train/target": [wandb.Image(rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                    #         "train/model_output": [wandb.Image(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                    #     }
-                    #     for k in log_dict:
-                    #         logs[k] = log_dict[k]
-                    if step % 1000 == 0:
-                        # 处理 source 图像
-                        x_src_vis = rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()
-                        x_src_vis = x_src_vis * 0.5 + 0.5  # 如果原图在 [-1,1] 范围，需要归一化到 [0,1]
-                        output_pil_src = transforms.ToPILImage()(x_src_vis)
-                        output_pil_src.save(os.path.join(output_dir, f"source_step{global_step}.png"))
+            if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
+                stage = accelerator.unwrap_model(model).stage
+                save_checkpoint(
+                    resume_dir / f"checkpoint-{global_step}.pt", accelerator.unwrap_model(model),
+                    optimizer, lr_scheduler, global_step,
+                    training_state(args, global_step, stage, best_metrics),
+                )
+                prune_checkpoints(resume_dir, args.checkpoints_total_limit)
 
-                        # 处理 target 图像
-                        x_tgt_vis = rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu()
-                        x_tgt_vis = x_tgt_vis * 0.5 + 0.5
-                        output_pil_tgt = transforms.ToPILImage()(x_tgt_vis)
-                        output_pil_tgt.save(os.path.join(output_dir, f"target_step{global_step}.png"))
-
-                    # checkpoint the model
-                    if global_step % args.checkpointing_steps == 1:
-                        outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
-                        # accelerator.unwrap_model(net_difix).save_model(outf)
-                        save_ckpt(accelerator.unwrap_model(net_difix), optimizer, outf)
-
-                    # compute validation set L2, LPIPS
-                    if args.eval_freq > 0 and global_step % args.eval_freq == 1:
-                        l_l2, l_lpips = [], []
-                        log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": []}
-                        for step, batch_val in enumerate(dl_val):
-                            #print(step)
-                            if step >= args.num_samples_eval:
-                                break
-                            x_src = batch_val["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
-                            x_tgt = batch_val["output_pixel_values"].to(accelerator.device, dtype=weight_dtype)
-                            B, V, C, H, W = x_src.shape
-                            assert B == 1, "Use batch size 1 for eval."
-                            with torch.no_grad():
-                                # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
-                                
-                                # if step % 10 == 0:
-                                #     log_dict["sample/source"].append(wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                #     log_dict["sample/target"].append(wandb.Image(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                #     log_dict["sample/model_output"].append(wandb.Image(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                x_src_vis = rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu()
-                                x_src_vis = x_src_vis * 0.5 + 0.5  # 如果原图在 [-1,1] 范围，需要归一化到 [0,1]
-                                #output_pil_src = transforms.ToPILImage()(x_src_vis)
-                                
-
-                                # 处理 target 图像
-                                x_tgt_vis = rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu()
-                                x_tgt_vis = x_tgt_vis * 0.5 + 0.5
-                                #output_pil_tgt = transforms.ToPILImage()(x_tgt_vis)
-
-                                # 处理 target 图像
-                                x_tgt_vis_pred = rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu()
-                                x_tgt_vis_pred = x_tgt_vis_pred * 0.5 + 0.5
-                                #output_pil_tgt = transforms.ToPILImage()(x_tgt_vis)
-                                combined = torch.cat([x_src_vis,x_tgt_vis_pred,x_tgt_vis], dim=2)
-                                output_pil = transforms.ToPILImage()(combined)
-                                outf = os.path.join(output_dir, f"{global_step}_{step}_pred_target.png")
-                                output_pil.save(outf)
-                                
-                                x_tgt = x_tgt[:, 0] # take the input view
-                                x_tgt_pred = x_tgt_pred[:, 0] # take the input view
-                                # compute the reconstruction losses
-                                loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
-                                loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
-
-                                l_l2.append(loss_l2.item())
-                                l_lpips.append(loss_lpips.item())
-
-                        logs["val/l2"] = np.mean(l_l2)
-                        logs["val/lpips"] = np.mean(l_lpips)
-                        for k in log_dict:
-                            logs[k] = log_dict[k]
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                    accelerator.log(logs, step=global_step)
-                    
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        stage = accelerator.unwrap_model(model).stage
+        save_checkpoint(
+            resume_dir / f"checkpoint-{global_step}.pt", accelerator.unwrap_model(model),
+            optimizer, lr_scheduler, global_step,
+            training_state(args, global_step, stage, best_metrics),
+        )
+        prune_checkpoints(resume_dir, args.checkpoints_total_limit)
+        save_checkpoint(
+            checkpoint_dir / "final.pt", accelerator.unwrap_model(model),
+            None, None, global_step,
+            training_state(args, global_step, stage, best_metrics),
+            checkpoint_kind="weights",
+        )
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
-    
-    parser = argparse.ArgumentParser()
-    # args for the loss function
-    parser.add_argument("--lambda_lpips", default=1.0, type=float)
-    parser.add_argument("--lambda_l2", default=1.0, type=float)
-    parser.add_argument("--lambda_gram", default=1.0, type=float)
-    parser.add_argument("--gram_loss_warmup_steps", default=2000, type=int)
-    parser.add_argument("--neg_prob", default=0.3, type=float, help="Probability of using negative prompt guidance")
-
-    # dataset options
-    parser.add_argument("--dataset_path", required=True, type=str)
-    parser.add_argument("--train_image_prep", default="resized_crop_512", type=str)
-    parser.add_argument("--test_image_prep", default="resized_crop_512", type=str)
-    parser.add_argument("--prompt", default=None, type=str)
-
-    # validation eval args
-    parser.add_argument("--eval_freq", default=100, type=int)
-    parser.add_argument("--num_samples_eval", type=int, default=10, help="Number of samples to use for all evaluation")
-
-    parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
-    parser.add_argument("--tracker_project_name", type=str, default="difix", help="The name of the wandb project to log to.")
-    parser.add_argument("--tracker_run_name", type=str, required=True)
-
-    # details about the model architecture
-    parser.add_argument("--pretrained_model_name_or_path")
-    parser.add_argument("--revision", type=str, default=None,)
-    parser.add_argument("--variant", type=str, default=None,)
-    parser.add_argument("--tokenizer_name", type=str, default=None)
-    parser.add_argument("--lora_rank_vae", default=4, type=int)
-    parser.add_argument("--timestep", default=199, type=int)
-    parser.add_argument("--mv_unet", action="store_true")
-
-    # training details
-    parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--cache_dir", default=None,)
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-    parser.add_argument("--resolution", type=int, default=512,)
-    parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader.")
-    parser.add_argument("--num_training_epochs", type=int, default=10)
-    parser.add_argument("--max_train_steps", type=int, default=10_000,)
-    parser.add_argument("--checkpointing_steps", type=int, default=500,)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.",)
-    parser.add_argument("--gradient_checkpointing", action="store_true",)
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
-    parser.add_argument("--lr_scheduler", type=str, default="constant",
-        help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),
-    )
-    parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler.")
-    parser.add_argument("--lr_num_cycles", type=int, default=1,
-        help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
-    )
-    parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
-
-    parser.add_argument("--dataloader_num_workers", type=int, default=0,)
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--allow_tf32", action="store_true",
-        help=(
-            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
-            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
-        ),
-    )
-    parser.add_argument("--report_to", type=str, default="wandb",
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
-            ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
-        ),
-    )
-    parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"],)
-    parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers.")
-    parser.add_argument("--set_grads_to_none", action="store_true",)
-    
-    # resume
-    parser.add_argument("--resume", default=None, type=str)
-
-    args = parser.parse_args()
-
-    main(args)
+    main(parse_args())

@@ -1,243 +1,148 @@
-# Difix3D+
+# hhDifix：双视图二阶段去雨精修
 
-**Difix3D+: Improving 3D Reconstructions with Single-Step Diffusion Models**  
-[Jay Zhangjie Wu*](https://zhangjiewu.github.io/), [Yuxuan Zhang*](https://scholar.google.com/citations?user=Jt5VvNgAAAAJ&hl=en), [Haithem Turki](https://haithemturki.com/), [Xuanchi Ren](https://xuanchiren.com/), [Jun Gao](https://www.cs.toronto.edu/~jungao/),  
-[Mike Zheng Shou](https://sites.google.com/view/showlab/home?authuser=0), [Sanja Fidler](https://www.cs.utoronto.ca/~fidler/), [Zan Gojcic†](https://zgojcic.github.io/), [Huan Ling†](https://www.cs.toronto.edu/~linghuan/) _(*/† equal contribution/advising)_  
-CVPR 2025 (Oral)  
-[Project Page](https://research.nvidia.com/labs/toronto-ai/difix3d/) | [Paper](https://arxiv.org/abs/2503.01774) | [Model](https://huggingface.co/nvidia/difix) | [Demo](https://huggingface.co/spaces/nvidia/difix)
+hhDifix 使用原始雨图 `R` 和冻结的初步去雨模型离线生成图 `P`，通过双视图
+SD-Turbo/Difix 联合 attention 输出最终干净图：
 
-<div align="center">
-  <img src="assets/demo.gif" alt=""  width="1100" />
-</div>
+```text
+[rainy R, preliminary P] + prompt -> two-view Difix -> clean GT
+```
 
+主任务固定使用已对齐的 RGB 512×512 图像。项目不负责训练或调用初步去雨
+UNet，也不会在训练过程中读取验证/测试 GT 来生成 `P`。
 
-## News
-
-* [11/06/2025] Code and models are now available! We will present our work at CVPR 2025 ([oral](https://cvpr.thecvf.com/virtual/2025/oral/35364), [poster](https://cvpr.thecvf.com/virtual/2025/poster/34172)). See you in Nashville🎵!
-
-
-## Setup
+## 安装
 
 ```bash
-git clone https://github.com/nv-tlabs/Difix3D.git
-cd Difix3D
 pip install -r requirements.txt
 ```
 
-## Quickstart (diffusers)
+需要支持 BF16 的 CUDA GPU。当前两阶段动态 optimizer 仅支持单 GPU；首次运行会从 Hugging Face 下载
+`stabilityai/sd-turbo`。官方 3D/gsplat/nerfstudio 示例保留在 `examples/`，不属于
+去雨入口，也不在主依赖中。
 
-```
-from pipeline_difix import DifixPipeline
-from diffusers.utils import load_image
+## 数据
 
-pipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
-pipe.to("cuda")
-
-input_image = load_image("assets/example_input.png")
-prompt = "remove degradation"
-
-output_image = pipe(prompt, image=input_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-output_image.save("example_output.png")
-```
-
-Optionally, you can use a reference image to guide the denoising process.
-```
-from pipeline_difix import DifixPipeline
-from diffusers.utils import load_image
-
-pipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
-pipe.to("cuda")
-
-input_image = load_image("assets/example_input.png")
-ref_image = load_image("assets/example_ref.png")
-prompt = "remove degradation"
-
-output_image = pipe(prompt, image=input_image, ref_image=ref_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-output_image.save("example_output.png")
-```
-
-## Difix: Single-step diffusion for 3D artifact removal
-
-### Training
-
-#### Data Preparation
-
-Prepare your dataset in the following JSON format:
+三个目录必须具有完全相同的文件 stem；扩展名可以不同。每张图必须是 RGB
+512×512。复制 `data/derain.example.json` 为 `data/derain.json` 并填写路径：
 
 ```json
 {
   "train": {
-    "{data_id}": {
-      "image": "{PATH_TO_IMAGE}",
-      "target_image": "{PATH_TO_TARGET_IMAGE}",
-      "ref_image": "{PATH_TO_REF_IMAGE}",
-      "prompt": "remove degradation"
-    }
+    "image": "/data/train/rainy",
+    "ref_image": "/data/train/preliminary",
+    "target_image": "/data/train/gt",
+    "prompt": "remove rain streaks and restore a clean natural image"
   },
   "test": {
-    "{data_id}": {
-      "image": "{PATH_TO_IMAGE}",
-      "target_image": "{PATH_TO_TARGET_IMAGE}",
-      "ref_image": "{PATH_TO_REF_IMAGE}",
-      "prompt": "remove degradation"
-    }
+    "image": "/data/test/rainy",
+    "ref_image": "/data/test/preliminary",
+    "target_image": "/data/test/gt",
+    "prompt": "remove rain streaks and restore a clean natural image"
   }
 }
 ```
 
-#### Single GPU
+Dataset 输出：
+
+- `conditioning_pixel_values`: `[2,3,512,512]`，顺序 `[R,P]`，范围 `[-1,1]`
+- `target_pixel_values`: `[3,512,512]`，仅 GT，范围 `[-1,1]`
+- `input_ids`: `[77]`
+
+默认增强为三图同步水平翻转、20% reference dropout（`P=R`）和 10% clean
+identity（`[GT,GT] -> GT`）。不进行 resize、旋转、噪声合成或颜色抖动。
+
+## 训练
+
+单卡：
+
+```bash
+bash src/train_singlegpu.sh
+```
+
+或直接执行：
 
 ```bash
 accelerate launch --mixed_precision=bf16 src/train_difix.py \
-    --output_dir=./outputs/difix/train \
-    --dataset_path="data/data.json" \
-    --max_train_steps 10000 \
-    --resolution=512 --learning_rate 2e-5 \
-    --train_batch_size=1 --dataloader_num_workers 8 \
-    --enable_xformers_memory_efficient_attention \
-    --checkpointing_steps=1000 --eval_freq 1000 --viz_freq 100 \
-    --lambda_lpips 1.0 --lambda_l2 1.0 --lambda_gram 1.0 --gram_loss_warmup_steps 2000 \
-    --report_to "wandb" --tracker_project_name "difix" --tracker_run_name "train" --timestep 199
+  --dataset_path data/derain.json \
+  --output_dir outputs/hhdifix \
+  --train_batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --checkpointing_steps 500 \
+  --checkpoints_total_limit 5 \
+  --eval_freq 500
 ```
 
-#### Multipe GPUs
+默认有效 batch size 为 8。训练分为：
+
+- 阶段 A：15,000 steps，仅 UNet LoRA rank 16，LR `5e-5`，warmup 500
+- 阶段 B：5,000 steps，UNet LR `1e-5`，启用 VAE decoder LoRA rank 4，LR `1e-5`
+
+固定 `timestep=199`、`CFG=1.0`、prompt dropout 关闭、gradient clip 1.0。
+损失为：
+
+```text
+Charbonnier + 0.2 SSIM + 0.1 LPIPS + 0.05 Sobel
+```
+
+阶段 A 结束时先保存 `stage-a-final.pt`，然后在原 AdamW 上降低 UNet LR 并通过
+`add_param_group()` 加入 VAE decoder LoRA，因此 UNet Adam 动量会保留。checkpoint
+使用 v2 schema：`checkpoints/resume/checkpoint-*.pt` 保存 LoRA、optimizer、scheduler、
+阶段和 global step，自动只保留最近 5 个；`best.pt` 和 `final.pt` 是不含 optimizer 的
+轻量推理权重。所有 checkpoint 都不保存完整 SD-Turbo 权重。
+
+### 续训
+
+可以传入具体 checkpoint，也可以传入 checkpoint 目录（自动选择最大步数）：
 
 ```bash
-export NUM_NODES=1
-export NUM_GPUS=8
-accelerate launch --mixed_precision=bf16 --main_process_port 29501 --multi_gpu --num_machines $NUM_NODES --num_processes $NUM_GPUS src/train_difix.py \
-    --output_dir=./outputs/difix/train \
-    --dataset_path="data/data.json" \
-    --max_train_steps 10000 \
-    --resolution=512 --learning_rate 2e-5 \
-    --train_batch_size=1 --dataloader_num_workers 8 \
-    --enable_xformers_memory_efficient_attention \
-    --checkpointing_steps=1000 --eval_freq 1000 --viz_freq 100 \
-    --lambda_lpips 1.0 --lambda_l2 1.0 --lambda_gram 1.0 --gram_loss_warmup_steps 2000 \
-    --report_to "wandb" --tracker_project_name "difix" --tracker_run_name "train" --timestep 199
+accelerate launch --mixed_precision=bf16 src/train_difix.py \
+  --dataset_path data/derain.json \
+  --output_dir outputs/hhdifix \
+  --resume outputs/hhdifix/checkpoints
 ```
 
-### Inference
+目录恢复会从 `checkpoints/resume/` 选择数字最大的 checkpoint。也可以显式从
+`stage-a-final.pt` 恢复，加载阶段 A optimizer 后会自动完成 A→B 转换。数据、阶段
+步数、LoRA rank、prompt 和梯度累积参数应与原训练保持一致。
 
-Place the `model_*.pkl` in the `checkpoints` directory. You can run inference using the following command:
-
-```bash
-python src/inference_difix.py \
-    --model_path "checkpoints/model.pkl" \
-    --input_image "assets/example_input.png" \
-    --prompt "remove degradation" \
-    --output_dir "outputs/difix" \
-    --timestep 199
-```
-
-
-## Difix3D: Progressive 3D update
-
-### Data Format
-
-The data should be organized in the following structure:
-
-```
-DATA_DIR/
-├── {SCENE_ID}
-│   ├── colmap
-│   │   ├── sparse
-│   │   │   └── 0
-│   │   │       ├── cameras.bin
-│   │   │       ├── database.db
-│   │   │       └── ...
-│   ├── images
-│   │   ├── image_train_000001.png
-│   │   ├── image_train_000002.png
-│   │   ├── ...
-│   │   ├── image_eval_000200.png
-│   │   ├── image_eval_000201.png
-│   │   └── ...
-│   ├── images_2
-│   ├── images_4
-│   └── images_8
-```
-
-### nerfstudio
-
-Setup the nerfstudio environment.
-```bash
-cd examples/nerfstudio
-pip install -e .
-cd ../..
-```
-
-Run Difix3D finetuning with nerfstudio.
-```bash
-SCENE_ID=032dee9fb0a8bc1b90871dc5fe950080d0bcd3caf166447f44e60ca50ac04ec7
-DATA=DATA_DIR/${SCENE_ID}
-DATA_FACTOR=4
-CKPT_PATH=CKPR_DIR/${SCENE_ID}/nerfacto/nerfstudio_models/step-000029999.ckpt # Path to the pretrained checkpoint file
-OUTPUT_DIR=outputs/difix3d/nerfacto/${SCENE_ID}
-
-CUDA_VISIBLE_DEVICES=0 ns-train difix3d \
-    --data ${DATA} --pipeline.model.appearance-embed-dim 0 --pipeline.model.camera-optimizer.mode off --save_only_latest_checkpoint False --vis viewer \
-    --output_dir ${OUTPUT_DIR} --experiment_name ${SCENE_ID} --timestamp '' --load-checkpoint ${CKPT_PATH} \
-    --max_num_iterations 30000 --steps_per_eval_all_images 0 --steps_per_eval_batch 0 --steps_per_eval_image 0 --steps_per_save 2000 --viewer.quit-on-train-completion True \
-    nerfstudio-data --orientation-method none --center_method none --auto-scale-poses False --downscale_factor ${DATA_FACTOR} --eval_mode filename
-```
-
-### gsplat
-
-Install the gsplat following the instructions in the [gsplat repository](https://github.com/nerfstudio-project/gsplat?tab=readme-ov-file#installation).
-
-Run Difix3D finetuning with gsplat.
-```bash
-SCENE_ID=032dee9fb0a8bc1b90871dc5fe950080d0bcd3caf166447f44e60ca50ac04ec7
-DATA=DATA_DIR/${SCENE_ID}/gaussian_splat
-DATA_FACTOR=4
-CKPT_PATH=CKPT_DIR/${SCENE_ID}/ckpts/ckpt_29999_rank0.pt # Path to the pretrained checkpoint file
-OUTPUT_DIR=outputs/difix3d/gsplat/${SCENE_ID}
-
-CUDA_VISIBLE_DEVICES=0 python examples/gsplat/simple_trainer_difix3d.py default \
-    --data_dir ${DATA} --data_factor ${DATA_FACTOR} \
-    --result_dir ${OUTPUT_DIR} --no-normalize-world-space --test_every 1 --ckpt ${CKPT_PATH}
-```
-
-
-## Difix3D+: With real-time post-rendering
-
-Due to the limited capacity of reconstruction methods to represent sharp details, some regions remain blurry. To further enhance the novel views, we use our Difix model as the final post-processing step at render time.
+## 推理
 
 ```bash
 python src/inference_difix.py \
-    --model_path "checkpoints/model.pkl" \
-    --input_image "PATH_TO_IMAGES" \
-    --prompt "remove degradation" \
-    --output_dir "outputs/difix3d+" \
-    --timestep 199
+  --rainy_dir /data/test/rainy \
+  --preliminary_dir /data/test/preliminary \
+  --checkpoint outputs/hhdifix/checkpoints/final.pt \
+  --output_dir outputs/hhdifix/results
 ```
 
-## Acknowledgements
+推理严格按 stem 配对并检查同尺寸，使用 VAE posterior `mode()`，因此固定权重和
+输入下输出确定。默认 prompt 来自 checkpoint；只有显式传入 `--prompt` 时才覆盖。
 
-Our work is built upon the following projects:
-- [diffusers](https://github.com/huggingface/diffusers)
-- [img2img-turbo](https://github.com/GaParmar/img2img-turbo)
-- [nerfstudio](https://github.com/nerfstudio-project/nerfstudio)
-- [gsplat](https://github.com/nerfstudio-project/gsplat)
-- [DL3DV-10K](https://github.com/DL3DV-10K/Dataset)
-- [nerfbusters](https://github.com/ethanweber/nerfbusters)
+## 评测
 
-Shoutout to all the contributors of these projects for their invaluable work that made this research possible.
-
-## License/Terms of Use:
-
-The use of the model and code is governed by the NVIDIA License. See [LICENSE.txt](LICENSE.txt) for details.
-Additional Information:  [LICENSE.md · stabilityai/sd-turbo at main](https://huggingface.co/stabilityai/sd-turbo/blob/main/LICENSE.md)
-
-## Citation
-
-```bibtex
-@inproceedings{wu2025difix3d+,
-  title={DIFIX3D+: Improving 3D Reconstructions with Single-Step Diffusion Models},
-  author={Wu, Jay Zhangjie and Zhang, Yuxuan and Turki, Haithem and Ren, Xuanchi and Gao, Jun and Shou, Mike Zheng and Fidler, Sanja and Gojcic, Zan and Ling, Huan},
-  booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
-  pages={26024--26035},
-  year={2025}
-}
+```bash
+python src/evaluate_img.py \
+  --rainy_dir /data/test/rainy \
+  --preliminary_dir /data/test/preliminary \
+  --final_dir outputs/hhdifix/results \
+  --gt_dir /data/test/gt \
+  --output outputs/hhdifix/metrics.json
 ```
+
+训练期 validation 和独立评测都会报告 Rainy、Preliminary、Final 各自的
+PSNR/SSIM/LPIPS，以及 Final 相对 Preliminary 的 ΔPSNR、ΔLPIPS 和逐样本胜率。
+`best.pt` 首先按最高 Final PSNR 选择，相同时依次比较更低 LPIPS 和更高 SSIM。
+
+## 测试
+
+```bash
+pytest -q
+python -m compileall -q src tests
+```
+
+完整验收还需在目标 GPU 上执行：小样本过拟合、双视图 forward、LoRA 梯度、
+checkpoint round-trip、resume 学习率连续性以及端到端训练/推理/评测。
+
+## License
+
+代码沿用原项目 [LICENSE.txt](LICENSE.txt)，基础模型另受 SD-Turbo 许可证约束。

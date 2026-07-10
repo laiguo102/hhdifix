@@ -1,0 +1,14 @@
+{
+  "train": {
+    "image": "/path/to/train/rainy",
+    "ref_image": "/path/to/train/preliminary",
+    "target_image": "/path/to/train/gt",
+    "prompt": "remove rain streaks and restore a clean natural image"
+  },
+  "test": {
+    "image": "/path/to/test/rainy",
+    "ref_image": "/path/to/test/preliminary",
+    "target_image": "/path/to/test/gt",
+    "prompt": "remove rain streaks and restore a clean natural image"
+  }
+}

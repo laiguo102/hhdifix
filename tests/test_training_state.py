@@ -1,0 +1,245 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+
+from src.model import load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from src.train_difix import checkpoint_to_resume, prune_checkpoints, resolve_prompt, transition_to_stage_b, validate
+
+
+class TinyBranch(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lora_weight = torch.nn.Parameter(torch.tensor([1.0]))
+
+
+class TinyDifix(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unet = TinyBranch()
+        self.vae = TinyBranch()
+        self.stage = "A"
+        self.set_stage("A")
+
+    def set_stage(self, stage):
+        self.stage = stage
+        self.unet.lora_weight.requires_grad_(True)
+        self.vae.lora_weight.requires_grad_(stage == "B")
+
+    def trainable_vae_lora_parameters(self):
+        return [self.vae.lora_weight] if self.vae.lora_weight.requires_grad else []
+
+    def checkpoint_config(self):
+        return {
+            "base_model": "tiny",
+            "num_views": 2,
+            "lora_rank_unet": 1,
+            "lora_rank_vae": 1,
+            "timestep": 199,
+            "prompt": "derain",
+            "cfg_scale": 1.0,
+            "stage": self.stage,
+        }
+
+
+class DummyLPIPS(torch.nn.Module):
+    def forward(self, prediction, target):
+        return (prediction - target).abs().flatten(1).mean(1).view(-1, 1, 1, 1)
+
+
+class DummyCriterion(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lpips_model = DummyLPIPS()
+
+    def forward(self, prediction, target):
+        return (prediction - target).square().mean(), {}
+
+
+class ValidationModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.unet = torch.nn.Identity()
+        self.vae = torch.nn.Module()
+        self.vae.encoder = torch.nn.Identity()
+        self.vae.decoder = torch.nn.Identity()
+        self.text_encoder = torch.nn.Identity()
+        self.stage = "A"
+        self.set_stage("A")
+
+    def set_stage(self, stage):
+        self.stage = stage
+        self.training = True
+        self.unet.train()
+        self.vae.eval()
+        if stage == "B":
+            self.vae.decoder.train()
+        self.text_encoder.eval()
+
+    def forward(self, conditioning, _tokens, deterministic=False):
+        assert deterministic
+        return conditioning
+
+
+class DummyAccelerator:
+    device = torch.device("cpu")
+
+    @staticmethod
+    def unwrap_model(model):
+        return model
+
+
+def _args():
+    return SimpleNamespace(stage_b_unet_lr=1e-5, vae_lr=1e-5)
+
+
+def _stage_a_optimizer(model):
+    return torch.optim.AdamW([{
+        "params": [model.unet.lora_weight],
+        "lr": 5e-5,
+        "name": "unet_lora",
+    }])
+
+
+def _initialize_adam_state(model, optimizer):
+    loss = model.unet.lora_weight.square().sum()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def test_stage_b_transition_preserves_unet_adam_state():
+    model = TinyDifix()
+    optimizer = _stage_a_optimizer(model)
+    _initialize_adam_state(model, optimizer)
+    exp_avg = optimizer.state[model.unet.lora_weight]["exp_avg"].clone()
+    optimizer_id = id(optimizer)
+
+    returned = transition_to_stage_b(model, optimizer, _args())
+
+    assert id(returned) == optimizer_id
+    assert [group["name"] for group in optimizer.param_groups] == ["unet_lora", "vae_decoder_lora"]
+    assert optimizer.param_groups[0]["lr"] == 1e-5
+    assert optimizer.param_groups[1]["lr"] == 1e-5
+    assert torch.equal(optimizer.state[model.unet.lora_weight]["exp_avg"], exp_avg)
+    assert model.vae.lora_weight not in optimizer.state
+
+
+def test_stage_a_checkpoint_roundtrip_and_boundary_resume(tmp_path):
+    model = TinyDifix()
+    optimizer = _stage_a_optimizer(model)
+    _initialize_adam_state(model, optimizer)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    path = tmp_path / "stage-a-final.pt"
+    save_checkpoint(
+        path, model, optimizer, scheduler, 15_000,
+        {"global_step": 15_000, "stage": "A", "stage_step": 15_000, "best_metrics": None},
+    )
+
+    restored = TinyDifix()
+    restored_optimizer = _stage_a_optimizer(restored)
+    restored_scheduler = torch.optim.lr_scheduler.LambdaLR(restored_optimizer, lambda _step: 1.0)
+    state = load_checkpoint(path, restored, restored_optimizer, restored_scheduler)
+
+    assert state["global_step"] == 15_000
+    assert state["stage"] == "A"
+    assert torch.equal(restored.unet.lora_weight, model.unet.lora_weight)
+    transition_to_stage_b(restored, restored_optimizer, _args())
+    assert restored.stage == "B"
+    assert [group["name"] for group in restored_optimizer.param_groups] == ["unet_lora", "vae_decoder_lora"]
+    assert restored_optimizer.state[restored.unet.lora_weight]["step"].item() == 1
+
+    stage_b_scheduler = torch.optim.lr_scheduler.LambdaLR(restored_optimizer, lambda _step: 1.0)
+    stage_b_path = tmp_path / "checkpoint-15000.pt"
+    save_checkpoint(
+        stage_b_path, restored, restored_optimizer, stage_b_scheduler, 15_000,
+        {"global_step": 15_000, "stage": "B", "stage_step": 0, "best_metrics": None},
+    )
+    stage_b_restored = TinyDifix()
+    stage_b_restored.set_stage("B")
+    stage_b_optimizer = torch.optim.AdamW([
+        {"params": [stage_b_restored.unet.lora_weight], "lr": 1e-5, "name": "unet_lora"},
+        {"params": [stage_b_restored.vae.lora_weight], "lr": 1e-5, "name": "vae_decoder_lora"},
+    ])
+    stage_b_scheduler_restored = torch.optim.lr_scheduler.LambdaLR(stage_b_optimizer, lambda _step: 1.0)
+    stage_b_state = load_checkpoint(
+        stage_b_path, stage_b_restored, stage_b_optimizer, stage_b_scheduler_restored
+    )
+    assert stage_b_state["stage"] == "B"
+    assert stage_b_state["stage_step"] == 0
+    assert len(stage_b_optimizer.param_groups) == 2
+
+
+def test_weights_checkpoint_has_no_optimizer(tmp_path):
+    model = TinyDifix()
+    path = tmp_path / "best.pt"
+    save_checkpoint(path, model, None, None, 42, checkpoint_kind="weights")
+    metadata = read_checkpoint_metadata(path)
+    payload = torch.load(path, map_location="cpu")
+    assert metadata["checkpoint_kind"] == "weights"
+    assert "optimizer" not in payload
+    assert "scheduler" not in payload
+
+
+def test_checkpoint_retention_keeps_latest_five(tmp_path):
+    for step in range(1_000, 9_000, 1_000):
+        (tmp_path / f"checkpoint-{step}.pt").touch()
+    (tmp_path / "checkpoint-broken.pt").touch()
+    (tmp_path / "checkpoint-9000.pt.tmp").touch()
+
+    prune_checkpoints(tmp_path, keep_last=5)
+
+    remaining = sorted(path.name for path in tmp_path.glob("checkpoint-*.pt"))
+    assert remaining == [
+        "checkpoint-4000.pt", "checkpoint-5000.pt", "checkpoint-6000.pt",
+        "checkpoint-7000.pt", "checkpoint-8000.pt", "checkpoint-broken.pt",
+    ]
+
+
+def test_auto_resume_ignores_non_numeric_checkpoints(tmp_path):
+    resume = tmp_path / "checkpoints" / "resume"
+    resume.mkdir(parents=True)
+    (resume / "checkpoint-broken.pt").touch()
+    (resume / "checkpoint-500.pt").touch()
+    (resume / "checkpoint-1500.pt").touch()
+    assert checkpoint_to_resume(str(tmp_path)).name == "checkpoint-1500.pt"
+
+
+def test_prompt_resolution_and_cli_override(tmp_path):
+    path = tmp_path / "data.json"
+    path.write_text(
+        '{"train":{"prompt":"json prompt"},"test":{"prompt":"json prompt"}}',
+        encoding="utf-8",
+    )
+    assert resolve_prompt(str(path), None) == "json prompt"
+    assert resolve_prompt(str(path), "cli prompt") == "cli prompt"
+
+
+def test_mismatched_split_prompts_require_override(tmp_path):
+    path = tmp_path / "data.json"
+    path.write_text(
+        '{"train":{"prompt":"train"},"test":{"prompt":"test"}}',
+        encoding="utf-8",
+    )
+    try:
+        resolve_prompt(str(path), None)
+    except ValueError as error:
+        assert "prompts differ" in str(error)
+    else:
+        raise AssertionError("Expected mismatched prompts to fail")
+
+
+def test_validation_restores_stage_specific_modes():
+    model = ValidationModel()
+    criterion = DummyCriterion()
+    batch = {
+        "conditioning_pixel_values": torch.zeros(1, 2, 3, 16, 16),
+        "target_pixel_values": torch.zeros(1, 3, 16, 16),
+        "input_ids": torch.zeros(1, 77, dtype=torch.long),
+    }
+    metrics = validate(model, [batch], criterion, DummyAccelerator())
+    assert "val/final_psnr" in metrics
+    assert model.training
+    assert model.unet.training
+    assert not model.vae.training
+    assert not model.text_encoder.training
