@@ -1,0 +1,15 @@
+{
+  "train": {
+    "target_image": "/home/bml/storage/mnt/v-7c231cc5f5054b0a/org/data/micro_sensor/lr_100",
+    "image": "/home/bml/storage/mnt/v-7c231cc5f5054b0a/org/data/micro_sensor/gt_100",
+    "ref_image": "/home/bml/storage/mnt/v-7c231cc5f5054b0a/org/data/NMI/Simulation/train/gt_simulation",
+    "prompt": "add degradation"
+
+  },
+  "test": {
+    "target_image": "/home/bml/storage/mnt/v-7c231cc5f5054b0a/org/data/micro_sensor/lr_100",
+    "image": "/home/bml/storage/mnt/v-7c231cc5f5054b0a/org/data/micro_sensor/gt_100",
+    "ref_image": "/home/bml/storage/mnt/v-7c231cc5f5054b0a/org/data/NMI/Simulation/train/gt_simulation",
+    "prompt": "add degradation"
+  }
+}
