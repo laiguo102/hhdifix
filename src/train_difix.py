@@ -15,11 +15,21 @@ from diffusers.optimization import get_scheduler
 from tqdm.auto import tqdm
 
 try:
-    from dataset import DEFAULT_PROMPT, PairedDataset
+    from dataset import (
+        DEFAULT_PROMPT,
+        PRELIMINARY_VIEW_INDEX,
+        RAINY_VIEW_INDEX,
+        PairedDataset,
+    )
     from loss import DerainLoss, _ssim_map
     from model import Difix, load_checkpoint, read_checkpoint_metadata, save_checkpoint
 except ImportError:
-    from .dataset import DEFAULT_PROMPT, PairedDataset
+    from .dataset import (
+        DEFAULT_PROMPT,
+        PRELIMINARY_VIEW_INDEX,
+        RAINY_VIEW_INDEX,
+        PairedDataset,
+    )
     from .loss import DerainLoss, _ssim_map
     from .model import Difix, load_checkpoint, read_checkpoint_metadata, save_checkpoint
 
@@ -196,11 +206,11 @@ def validate(model, dataloader, criterion, accelerator):
             conditioning = batch["conditioning_pixel_values"].to(accelerator.device)
             target = batch["target_pixel_values"].to(accelerator.device)
             tokens = batch["input_ids"].to(accelerator.device)
-            final = model(conditioning, tokens, deterministic=True)[:, 0]
+            final = model(conditioning, tokens, deterministic=True)[:, PRELIMINARY_VIEW_INDEX]
             loss, _ = criterion(final, target)
             variants = {
-                "rainy": conditioning[:, 0],
-                "preliminary": conditioning[:, 1],
+                "rainy": conditioning[:, RAINY_VIEW_INDEX],
+                "preliminary": conditioning[:, PRELIMINARY_VIEW_INDEX],
                 "final": final,
             }
             batch_metrics = {}
@@ -368,7 +378,7 @@ def main(args):
                 prediction = model(
                     conditioning, tokens, cfg_scale=args.cfg_scale,
                     empty_prompt_tokens=empty_tokens.expand(tokens.shape[0], -1),
-                )[:, 0]
+                )[:, PRELIMINARY_VIEW_INDEX]
                 loss, terms = criterion(prediction, target)
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

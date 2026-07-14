@@ -18,6 +18,9 @@ from transformers import AutoTokenizer, CLIPTextModel
 BASE_MODEL = "stabilityai/sd-turbo"
 DEFAULT_PROMPT = "remove rain streaks and restore a clean natural image"
 CHECKPOINT_SCHEMA_VERSION = 2
+DEFAULT_VIEW_ORDER = "preliminary_rainy"
+LEGACY_VIEW_ORDER = "rainy_preliminary"
+SUPPORTED_VIEW_ORDERS = {DEFAULT_VIEW_ORDER, LEGACY_VIEW_ORDER}
 UNET_LORA_TARGETS = [
     "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2",
     "conv_shortcut", "conv_out", "proj_in", "proj_out", "ff.net.2",
@@ -53,13 +56,19 @@ class Difix(torch.nn.Module):
         timestep: int = 199,
         prompt: str = DEFAULT_PROMPT,
         cfg_scale: float = 1.0,
+        view_order: str = DEFAULT_VIEW_ORDER,
     ) -> None:
         super().__init__()
+        if view_order not in SUPPORTED_VIEW_ORDERS:
+            raise ValueError(
+                f"Unsupported view_order={view_order!r}; expected one of {sorted(SUPPORTED_VIEW_ORDERS)}"
+            )
         self.base_model = base_model
         self.lora_rank_unet = lora_rank_unet
         self.lora_rank_vae = lora_rank_vae
         self.prompt = prompt
         self.cfg_scale = cfg_scale
+        self.view_order = view_order
         self.tokenizer = AutoTokenizer.from_pretrained(base_model, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
         self.vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae")
@@ -201,7 +210,11 @@ class Difix(torch.nn.Module):
             prompt, max_length=self.tokenizer.model_max_length, padding="max_length",
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
-        pixels = torch.stack((TF.to_tensor(rainy), TF.to_tensor(preliminary)))
+        images = {
+            "rainy_preliminary": (rainy, preliminary),
+            "preliminary_rainy": (preliminary, rainy),
+        }[self.view_order]
+        pixels = torch.stack(tuple(TF.to_tensor(image) for image in images))
         pixels = pixels.mul(2).sub(1).unsqueeze(0).to(device)
         empty_tokens = None
         if cfg_scale != 1.0:
@@ -224,6 +237,7 @@ class Difix(torch.nn.Module):
             "timestep": self.timestep,
             "prompt": self.prompt,
             "cfg_scale": self.cfg_scale,
+            "view_order": self.view_order,
             "stage": self.stage,
         }
 
@@ -296,9 +310,15 @@ def load_checkpoint(
         raise ValueError("Only checkpoint schema v2 is supported")
     config = checkpoint["config"]
     expected = model.checkpoint_config()
-    for key in ("base_model", "num_views", "lora_rank_unet", "lora_rank_vae", "timestep", "prompt", "cfg_scale"):
-        if config[key] != expected[key]:
-            raise ValueError(f"Checkpoint {key}={config[key]!r}, model expects {expected[key]!r}")
+    saved_config = {**config, "view_order": config.get("view_order", LEGACY_VIEW_ORDER)}
+    for key in (
+        "base_model", "num_views", "lora_rank_unet", "lora_rank_vae",
+        "timestep", "prompt", "cfg_scale", "view_order",
+    ):
+        if saved_config[key] != expected[key]:
+            raise ValueError(
+                f"Checkpoint {key}={saved_config[key]!r}, model expects {expected[key]!r}"
+            )
     model.set_stage(config.get("stage", "A"))
     _load_lora_state(model.unet, checkpoint["unet_lora"])
     _load_lora_state(model.vae, checkpoint["vae_decoder_lora"])
@@ -327,6 +347,7 @@ def model_from_checkpoint(path: str | Path, device: torch.device | str = "cuda")
         timestep=config["timestep"],
         prompt=config["prompt"],
         cfg_scale=config.get("cfg_scale", 1.0),
+        view_order=config.get("view_order", LEGACY_VIEW_ORDER),
     )
     load_checkpoint(path, model)
     model.eval().requires_grad_(False)

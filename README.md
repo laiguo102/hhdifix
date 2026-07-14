@@ -4,7 +4,7 @@ hhDifix 使用原始雨图 `R` 和冻结的初步去雨模型离线生成图 `P`
 SD-Turbo/Difix 联合 attention 输出最终干净图：
 
 ```text
-[rainy R, preliminary P] + prompt -> two-view Difix -> clean GT
+[preliminary P, rainy R] + prompt -> two-view Difix -> clean GT
 ```
 
 主任务固定使用已对齐的 RGB 512×512 图像。项目不负责训练或调用初步去雨
@@ -44,9 +44,14 @@ pip install -r requirements.txt
 
 Dataset 输出：
 
-- `conditioning_pixel_values`: `[2,3,512,512]`，顺序 `[R,P]`，范围 `[-1,1]`
+- `conditioning_pixel_values`: `[2,3,512,512]`，顺序 `[P,R]`，范围 `[-1,1]`
 - `target_pixel_values`: `[3,512,512]`，仅 GT，范围 `[-1,1]`
 - `input_ids`: `[77]`
+
+模型固定监督并输出 view 0，因此最终图像从 preliminary 的 latent 开始精修；原始雨图
+作为 view 1，通过双视图 attention 提供退化线索。新 checkpoint 会保存
+`view_order=preliminary_rainy`。没有该字段的旧 checkpoint 按旧顺序
+`rainy_preliminary` 加载，不能用于恢复新顺序训练。
 
 默认增强为三图同步水平翻转、20% reference dropout（`P=R`）和 10% clean
 identity（`[GT,GT] -> GT`）。不进行 resize、旋转、噪声合成或颜色抖动。

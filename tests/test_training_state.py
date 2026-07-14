@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from src.model import load_checkpoint, read_checkpoint_metadata, save_checkpoint
@@ -38,6 +39,7 @@ class TinyDifix(torch.nn.Module):
             "timestep": 199,
             "prompt": "derain",
             "cfg_scale": 1.0,
+            "view_order": "preliminary_rainy",
             "stage": self.stage,
         }
 
@@ -181,6 +183,25 @@ def test_weights_checkpoint_has_no_optimizer(tmp_path):
     assert "scheduler" not in payload
 
 
+def test_legacy_view_order_checkpoint_cannot_resume_new_training(tmp_path):
+    model = TinyDifix()
+    optimizer = _stage_a_optimizer(model)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    path = tmp_path / "legacy.pt"
+    save_checkpoint(path, model, optimizer, scheduler, 1)
+    payload = torch.load(path, map_location="cpu")
+    del payload["config"]["view_order"]
+    torch.save(payload, path)
+
+    restored = TinyDifix()
+    restored_optimizer = _stage_a_optimizer(restored)
+    restored_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        restored_optimizer, lambda _step: 1.0
+    )
+    with pytest.raises(ValueError, match="view_order"):
+        load_checkpoint(path, restored, restored_optimizer, restored_scheduler)
+
+
 def test_checkpoint_retention_keeps_latest_five(tmp_path):
     for step in range(1_000, 9_000, 1_000):
         (tmp_path / f"checkpoint-{step}.pt").touch()
@@ -232,13 +253,17 @@ def test_mismatched_split_prompts_require_override(tmp_path):
 def test_validation_restores_stage_specific_modes():
     model = ValidationModel()
     criterion = DummyCriterion()
+    conditioning = torch.zeros(1, 2, 3, 16, 16)
+    conditioning[:, 1] = 1
     batch = {
-        "conditioning_pixel_values": torch.zeros(1, 2, 3, 16, 16),
+        "conditioning_pixel_values": conditioning,
         "target_pixel_values": torch.zeros(1, 3, 16, 16),
         "input_ids": torch.zeros(1, 77, dtype=torch.long),
     }
     metrics = validate(model, [batch], criterion, DummyAccelerator())
     assert "val/final_psnr" in metrics
+    assert metrics["val/final_psnr"] == metrics["val/preliminary_psnr"]
+    assert metrics["val/final_psnr"] > metrics["val/rainy_psnr"]
     assert model.training
     assert model.unet.training
     assert not model.vae.training

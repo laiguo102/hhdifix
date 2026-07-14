@@ -14,6 +14,8 @@ from torchvision.transforms import functional as TF
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 DEFAULT_PROMPT = "remove rain streaks and restore a clean natural image"
+PRELIMINARY_VIEW_INDEX = 0
+RAINY_VIEW_INDEX = 1
 
 
 def _files_by_stem(directory: str | Path) -> Dict[str, Path]:
@@ -41,7 +43,7 @@ def _format_stems(stems: Iterable[str]) -> str:
 
 
 class PairedDataset(torch.utils.data.Dataset):
-    """Return aligned ``[rainy, preliminary] -> clean`` training samples.
+    """Return aligned ``[preliminary, rainy] -> clean`` training samples.
 
     The JSON split is directory based and contains ``image``, ``ref_image``,
     ``target_image`` and optionally ``prompt``. Files are joined by stem, never
@@ -159,7 +161,10 @@ class PairedDataset(torch.utils.data.Dataset):
             preliminary = TF.hflip(preliminary)
             clean = TF.hflip(clean)
 
-        conditioning = torch.stack((rainy, preliminary), dim=0).mul(2.0).sub(1.0)
+        # View 0 is the image to refine, so the supervised output is decoded
+        # from the preliminary image latent. The rainy image remains view 1 and
+        # contributes degradation evidence through the multi-view attention.
+        conditioning = torch.stack((preliminary, rainy), dim=0).mul(2.0).sub(1.0)
         target = clean.mul(2.0).sub(1.0)
         output = {
             "conditioning_pixel_values": conditioning,

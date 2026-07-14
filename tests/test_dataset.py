@@ -5,7 +5,7 @@ import pytest
 import torch
 from PIL import Image
 
-from src.dataset import PairedDataset
+from src.dataset import PRELIMINARY_VIEW_INDEX, RAINY_VIEW_INDEX, PairedDataset
 
 
 class TokenizerStub:
@@ -21,10 +21,15 @@ def _write_rgb(path: Path, color=(10, 20, 30), size=(512, 512)):
 
 def _dataset_config(tmp_path: Path):
     dirs = {}
+    colors = {
+        "image": (10, 20, 30),
+        "ref_image": (40, 50, 60),
+        "target_image": (70, 80, 90),
+    }
     for key in ("image", "ref_image", "target_image"):
         dirs[key] = tmp_path / key
         dirs[key].mkdir()
-        _write_rgb(dirs[key] / "sample.png")
+        _write_rgb(dirs[key] / "sample.png", color=colors[key])
     config = {"train": {**{k: str(v) for k, v in dirs.items()}, "prompt": "derain"}}
     path = tmp_path / "data.json"
     path.write_text(json.dumps(config), encoding="utf-8")
@@ -47,6 +52,16 @@ def test_shapes_ranges_and_tokens(tmp_path):
     assert sample["input_ids"].shape == (77,)
     assert -1 <= sample["conditioning_pixel_values"].min() <= 1
     assert -1 <= sample["target_pixel_values"].max() <= 1
+    expected_preliminary = torch.tensor([40, 50, 60]).div(255).mul(2).sub(1)
+    expected_rainy = torch.tensor([10, 20, 30]).div(255).mul(2).sub(1)
+    torch.testing.assert_close(
+        sample["conditioning_pixel_values"][PRELIMINARY_VIEW_INDEX, :, 0, 0],
+        expected_preliminary,
+    )
+    torch.testing.assert_close(
+        sample["conditioning_pixel_values"][RAINY_VIEW_INDEX, :, 0, 0],
+        expected_rainy,
+    )
 
 
 def test_stem_mismatch_fails(tmp_path):
