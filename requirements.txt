@@ -10,4 +10,5 @@ lpips
 xformers
 tqdm
 Pillow
+numpy
 pytest

@@ -56,6 +56,31 @@ Dataset 输出：
 默认增强为三图同步水平翻转、20% reference dropout（`P=R`）和 10% clean
 identity（`[GT,GT] -> GT`）。不进行 resize、旋转、噪声合成或颜色抖动。
 
+### 生成有符号雨残差视图
+
+实验性 view 1 可以使用 `rainy - preliminary`。不要把负差值直接裁剪为黑色；生成脚本
+将 `[-255,255]` 居中编码到 RGB PNG 的 `[0,255]`，因此 Dataset 归一化后近似得到
+`(rainy-preliminary)/255`，零残差显示为中性灰色。
+
+```bash
+DATA=/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2
+
+python src/build_rain_residual.py \
+  --rainy_dir "$DATA/rain" \
+  --preliminary_dir "$DATA/images5000_2_background" \
+  --output_dir "$DATA/rain_minus_background" \
+  --expected_count 4900
+
+python src/build_rain_residual.py \
+  --rainy_dir "$DATA/valid/rain" \
+  --preliminary_dir "$DATA/valid/background" \
+  --output_dir "$DATA/valid/rain_minus_background" \
+  --expected_count 100
+```
+
+脚本严格按 stem 配对，检查 RGB、512×512 和预期数量，并始终输出无损 PNG。输出目录
+已有同名 PNG 时默认拒绝覆盖；确认需要重建时显式添加 `--overwrite`。
+
 ## 训练
 
 单卡：
