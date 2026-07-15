@@ -18,20 +18,32 @@ try:
     from dataset import (
         DEFAULT_PROMPT,
         PRELIMINARY_VIEW_INDEX,
-        RAINY_VIEW_INDEX,
         PairedDataset,
     )
     from loss import DerainLoss, _ssim_map
-    from model import Difix, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+    from model import (
+        DEFAULT_VIEW_ORDER,
+        RESIDUAL_VIEW_ORDER,
+        Difix,
+        load_checkpoint,
+        read_checkpoint_metadata,
+        save_checkpoint,
+    )
 except ImportError:
     from .dataset import (
         DEFAULT_PROMPT,
         PRELIMINARY_VIEW_INDEX,
-        RAINY_VIEW_INDEX,
         PairedDataset,
     )
     from .loss import DerainLoss, _ssim_map
-    from .model import Difix, load_checkpoint, read_checkpoint_metadata, save_checkpoint
+    from .model import (
+        DEFAULT_VIEW_ORDER,
+        RESIDUAL_VIEW_ORDER,
+        Difix,
+        load_checkpoint,
+        read_checkpoint_metadata,
+        save_checkpoint,
+    )
 
 
 def parse_args():
@@ -90,6 +102,20 @@ def resolve_prompt(dataset_path: str, cli_prompt: Optional[str]) -> str:
     if train_prompt != test_prompt:
         raise ValueError("train/test prompts differ; pass --prompt to provide one explicit prompt")
     return train_prompt
+
+
+def resolve_view_order(dataset_path: str) -> str:
+    with Path(dataset_path).open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    residual_splits = {
+        split: "residual_image" in config.get(split, {})
+        for split in ("train", "test")
+    }
+    if len(set(residual_splits.values())) != 1:
+        raise ValueError(
+            "train/test must either both define residual_image or both omit it"
+        )
+    return RESIDUAL_VIEW_ORDER if residual_splits["train"] else DEFAULT_VIEW_ORDER
 
 
 def make_optimizer(model: Difix, args, stage: str):
@@ -206,10 +232,11 @@ def validate(model, dataloader, criterion, accelerator):
             conditioning = batch["conditioning_pixel_values"].to(accelerator.device)
             target = batch["target_pixel_values"].to(accelerator.device)
             tokens = batch["input_ids"].to(accelerator.device)
+            rainy = batch["rainy_pixel_values"].to(accelerator.device)
             final = model(conditioning, tokens, deterministic=True)[:, PRELIMINARY_VIEW_INDEX]
             loss, _ = criterion(final, target)
             variants = {
-                "rainy": conditioning[:, RAINY_VIEW_INDEX],
+                "rainy": rainy,
                 "preliminary": conditioning[:, PRELIMINARY_VIEW_INDEX],
                 "final": final,
             }
@@ -279,12 +306,20 @@ def main(args):
         resume_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_prompt = resolve_prompt(args.dataset_path, args.prompt)
+    resolved_view_order = resolve_view_order(args.dataset_path)
     resume_path = checkpoint_to_resume(args.resume)
     metadata = read_checkpoint_metadata(resume_path) if resume_path else None
     if metadata and metadata["checkpoint_kind"] != "training":
         raise ValueError("--resume requires a training checkpoint, not a weights-only checkpoint")
     if metadata and metadata["config"]["prompt"] != resolved_prompt:
         raise ValueError("Resolved dataset/CLI prompt differs from the checkpoint prompt")
+    if metadata:
+        saved_view_order = metadata["config"].get("view_order", "rainy_preliminary")
+        if saved_view_order != resolved_view_order:
+            raise ValueError(
+                f"Checkpoint view_order={saved_view_order!r} differs from "
+                f"dataset view_order={resolved_view_order!r}"
+            )
     if metadata:
         saved_state = metadata["training_state"]
         for key in ("stage_a_steps", "stage_b_steps"):
@@ -304,6 +339,7 @@ def main(args):
     model = Difix(
         args.base_model, args.lora_rank_unet, args.lora_rank_vae, args.timestep,
         prompt=resolved_prompt, cfg_scale=args.cfg_scale,
+        view_order=resolved_view_order,
     )
     optimizer = make_optimizer(model, args, initial_stage)
     lr_scheduler = make_lr_scheduler(optimizer, args, initial_stage)
@@ -345,7 +381,12 @@ def main(args):
     )
     if args.report_to != "none":
         accelerator.init_trackers(
-            args.tracker_project_name, config={**vars(args), "resolved_prompt": resolved_prompt},
+            args.tracker_project_name,
+            config={
+                **vars(args),
+                "resolved_prompt": resolved_prompt,
+                "resolved_view_order": resolved_view_order,
+            },
             init_kwargs={args.report_to: {"name": args.tracker_run_name}},
         )
     tokenizer = accelerator.unwrap_model(model).tokenizer

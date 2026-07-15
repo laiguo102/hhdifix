@@ -5,7 +5,12 @@ import pytest
 import torch
 from PIL import Image
 
-from src.dataset import PRELIMINARY_VIEW_INDEX, RAINY_VIEW_INDEX, PairedDataset
+from src.dataset import (
+    PRELIMINARY_VIEW_INDEX,
+    RAINY_VIEW_INDEX,
+    RESIDUAL_VIEW_INDEX,
+    PairedDataset,
+)
 
 
 class TokenizerStub:
@@ -19,14 +24,18 @@ def _write_rgb(path: Path, color=(10, 20, 30), size=(512, 512)):
     Image.new("RGB", size, color).save(path)
 
 
-def _dataset_config(tmp_path: Path):
+def _dataset_config(tmp_path: Path, with_residual=False):
     dirs = {}
     colors = {
         "image": (10, 20, 30),
         "ref_image": (40, 50, 60),
         "target_image": (70, 80, 90),
+        "residual_image": (128, 178, 103),
     }
-    for key in ("image", "ref_image", "target_image"):
+    keys = ["image", "ref_image", "target_image"]
+    if with_residual:
+        keys.append("residual_image")
+    for key in keys:
         dirs[key] = tmp_path / key
         dirs[key].mkdir()
         _write_rgb(dirs[key] / "sample.png", color=colors[key])
@@ -61,6 +70,57 @@ def test_shapes_ranges_and_tokens(tmp_path):
     torch.testing.assert_close(
         sample["conditioning_pixel_values"][RAINY_VIEW_INDEX, :, 0, 0],
         expected_rainy,
+    )
+    torch.testing.assert_close(sample["rainy_pixel_values"][:, 0, 0], expected_rainy)
+
+
+def test_residual_view_keeps_original_rainy_for_metrics(tmp_path):
+    config, _ = _dataset_config(tmp_path, with_residual=True)
+    dataset = PairedDataset(
+        config,
+        "train",
+        horizontal_flip_prob=0,
+        reference_dropout_prob=0,
+        clean_identity_prob=0,
+    )
+
+    sample = dataset[0]
+
+    expected_residual = torch.tensor([128, 178, 103]).div(255).mul(2).sub(1)
+    expected_rainy = torch.tensor([10, 20, 30]).div(255).mul(2).sub(1)
+    torch.testing.assert_close(
+        sample["conditioning_pixel_values"][RESIDUAL_VIEW_INDEX, :, 0, 0],
+        expected_residual,
+    )
+    torch.testing.assert_close(sample["rainy_pixel_values"][:, 0, 0], expected_rainy)
+
+
+@pytest.mark.parametrize(
+    ("reference_dropout", "clean_identity", "expected_view0"),
+    [
+        (1.0, 0.0, torch.tensor([40, 50, 60]).div(255).mul(2).sub(1)),
+        (0.0, 1.0, torch.tensor([70, 80, 90]).div(255).mul(2).sub(1)),
+    ],
+)
+def test_residual_dropout_and_identity_use_zero_auxiliary(
+    tmp_path, reference_dropout, clean_identity, expected_view0
+):
+    config, _ = _dataset_config(tmp_path, with_residual=True)
+    dataset = PairedDataset(
+        config,
+        "train",
+        horizontal_flip_prob=0,
+        reference_dropout_prob=reference_dropout,
+        clean_identity_prob=clean_identity,
+    )
+
+    conditioning = dataset[0]["conditioning_pixel_values"]
+
+    torch.testing.assert_close(
+        conditioning[PRELIMINARY_VIEW_INDEX, :, 0, 0], expected_view0
+    )
+    torch.testing.assert_close(
+        conditioning[RESIDUAL_VIEW_INDEX], torch.zeros_like(conditioning[RESIDUAL_VIEW_INDEX])
     )
 
 

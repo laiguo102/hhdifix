@@ -20,7 +20,8 @@ DEFAULT_PROMPT = "remove rain streaks and restore a clean natural image"
 CHECKPOINT_SCHEMA_VERSION = 2
 DEFAULT_VIEW_ORDER = "preliminary_rainy"
 LEGACY_VIEW_ORDER = "rainy_preliminary"
-SUPPORTED_VIEW_ORDERS = {DEFAULT_VIEW_ORDER, LEGACY_VIEW_ORDER}
+RESIDUAL_VIEW_ORDER = "preliminary_residual"
+SUPPORTED_VIEW_ORDERS = {DEFAULT_VIEW_ORDER, LEGACY_VIEW_ORDER, RESIDUAL_VIEW_ORDER}
 UNET_LORA_TARGETS = [
     "to_k", "to_q", "to_v", "to_out.0", "conv", "conv1", "conv2",
     "conv_shortcut", "conv_out", "proj_in", "proj_out", "ff.net.2",
@@ -210,12 +211,22 @@ class Difix(torch.nn.Module):
             prompt, max_length=self.tokenizer.model_max_length, padding="max_length",
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
-        images = {
-            "rainy_preliminary": (rainy, preliminary),
-            "preliminary_rainy": (preliminary, rainy),
-        }[self.view_order]
-        pixels = torch.stack(tuple(TF.to_tensor(image) for image in images))
-        pixels = pixels.mul(2).sub(1).unsqueeze(0).to(device)
+        rainy_tensor = TF.to_tensor(rainy)
+        preliminary_tensor = TF.to_tensor(preliminary)
+        if self.view_order == RESIDUAL_VIEW_ORDER:
+            # Match build_rain_residual.py exactly so training-time PNG inputs
+            # and inference-time online residuals have identical quantization.
+            rainy_u8 = rainy_tensor.mul(255).round().to(torch.int16)
+            preliminary_u8 = preliminary_tensor.mul(255).round().to(torch.int16)
+            encoded = ((rainy_u8 - preliminary_u8 + 256) // 2).to(torch.float32).div(255)
+            pixels = torch.stack((preliminary_tensor, encoded)).mul(2).sub(1)
+        else:
+            images = {
+                LEGACY_VIEW_ORDER: (rainy_tensor, preliminary_tensor),
+                DEFAULT_VIEW_ORDER: (preliminary_tensor, rainy_tensor),
+            }[self.view_order]
+            pixels = torch.stack(images).mul(2).sub(1)
+        pixels = pixels.unsqueeze(0).to(device)
         empty_tokens = None
         if cfg_scale != 1.0:
             empty_tokens = self.tokenizer(

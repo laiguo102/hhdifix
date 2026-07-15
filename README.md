@@ -4,7 +4,7 @@ hhDifix 使用原始雨图 `R` 和冻结的初步去雨模型离线生成图 `P`
 SD-Turbo/Difix 联合 attention 输出最终干净图：
 
 ```text
-[preliminary P, rainy R] + prompt -> two-view Difix -> clean GT
+[preliminary P, signed residual (R-P)] + prompt -> two-view Difix -> clean GT
 ```
 
 主任务固定使用已对齐的 RGB 512×512 图像。项目不负责训练或调用初步去雨
@@ -30,12 +30,14 @@ pip install -r requirements.txt
   "train": {
     "image": "/data/train/rainy",
     "ref_image": "/data/train/preliminary",
+    "residual_image": "/data/train/rain-minus-preliminary",
     "target_image": "/data/train/gt",
     "prompt": "remove rain streaks and restore a clean natural image"
   },
   "test": {
     "image": "/data/test/rainy",
     "ref_image": "/data/test/preliminary",
+    "residual_image": "/data/test/rain-minus-preliminary",
     "target_image": "/data/test/gt",
     "prompt": "remove rain streaks and restore a clean natural image"
   }
@@ -44,17 +46,19 @@ pip install -r requirements.txt
 
 Dataset 输出：
 
-- `conditioning_pixel_values`: `[2,3,512,512]`，顺序 `[P,R]`，范围 `[-1,1]`
+- `conditioning_pixel_values`: `[2,3,512,512]`，顺序 `[P,R-P]`，范围 `[-1,1]`
+- `rainy_pixel_values`: `[3,512,512]`，仅用于报告原始雨图验证指标
 - `target_pixel_values`: `[3,512,512]`，仅 GT，范围 `[-1,1]`
 - `input_ids`: `[77]`
 
-模型固定监督并输出 view 0，因此最终图像从 preliminary 的 latent 开始精修；原始雨图
-作为 view 1，通过双视图 attention 提供退化线索。新 checkpoint 会保存
-`view_order=preliminary_rainy`。没有该字段的旧 checkpoint 按旧顺序
-`rainy_preliminary` 加载，不能用于恢复新顺序训练。
+模型固定监督并输出 view 0，因此最终图像从 preliminary 的 latent 开始精修；有符号
+雨残差作为 view 1，通过双视图 attention 提供退化线索。checkpoint 保存
+`view_order=preliminary_residual`，不能从 `[R,P]` 或 `[P,R]` checkpoint 恢复训练。
+如果配置省略 `residual_image`，代码仍支持原来的 `[P,R]` 模式。
 
-默认增强为三图同步水平翻转、20% reference dropout（`P=R`）和 10% clean
-identity（`[GT,GT] -> GT`）。不进行 resize、旋转、噪声合成或颜色抖动。
+默认增强为所有配对图同步水平翻转、20% residual dropout
+（`[P,0] -> GT`）和 10% clean identity（`[GT,0] -> GT`）。不进行 resize、
+旋转、噪声合成或颜色抖动。
 
 ### 生成有符号雨残差视图
 
@@ -94,7 +98,7 @@ bash src/train_singlegpu.sh
 ```bash
 accelerate launch --mixed_precision=bf16 src/train_difix.py \
   --dataset_path data/derain.json \
-  --output_dir outputs/hhdifix \
+  --output_dir outputs/hhdifix-residual \
   --train_batch_size 2 \
   --gradient_accumulation_steps 4 \
   --checkpointing_steps 500 \
@@ -127,8 +131,8 @@ Charbonnier + 0.2 SSIM + 0.1 LPIPS + 0.05 Sobel
 ```bash
 accelerate launch --mixed_precision=bf16 src/train_difix.py \
   --dataset_path data/derain.json \
-  --output_dir outputs/hhdifix \
-  --resume outputs/hhdifix/checkpoints
+  --output_dir outputs/hhdifix-residual \
+  --resume outputs/hhdifix-residual/checkpoints
 ```
 
 目录恢复会从 `checkpoints/resume/` 选择数字最大的 checkpoint。也可以显式从
@@ -141,8 +145,8 @@ accelerate launch --mixed_precision=bf16 src/train_difix.py \
 python src/inference_difix.py \
   --rainy_dir /data/test/rainy \
   --preliminary_dir /data/test/preliminary \
-  --checkpoint outputs/hhdifix/checkpoints/final.pt \
-  --output_dir outputs/hhdifix/results
+  --checkpoint outputs/hhdifix-residual/checkpoints/final.pt \
+  --output_dir outputs/hhdifix-residual/results
 ```
 
 推理严格按 stem 配对并检查同尺寸，使用 VAE posterior `mode()`，因此固定权重和
@@ -154,9 +158,9 @@ python src/inference_difix.py \
 python src/evaluate_img.py \
   --rainy_dir /data/test/rainy \
   --preliminary_dir /data/test/preliminary \
-  --final_dir outputs/hhdifix/results \
+  --final_dir outputs/hhdifix-residual/results \
   --gt_dir /data/test/gt \
-  --output outputs/hhdifix/metrics.json
+  --output outputs/hhdifix-residual/metrics.json
 ```
 
 训练期 validation 和独立评测都会报告 Rainy、Preliminary、Final 各自的

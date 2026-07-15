@@ -4,8 +4,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from src.model import load_checkpoint, read_checkpoint_metadata, save_checkpoint
-from src.train_difix import checkpoint_to_resume, prune_checkpoints, resolve_prompt, transition_to_stage_b, validate
+from src.model import (
+    DEFAULT_VIEW_ORDER,
+    RESIDUAL_VIEW_ORDER,
+    load_checkpoint,
+    read_checkpoint_metadata,
+    save_checkpoint,
+)
+from src.train_difix import (
+    checkpoint_to_resume,
+    prune_checkpoints,
+    resolve_prompt,
+    resolve_view_order,
+    transition_to_stage_b,
+    validate,
+)
 
 
 class TinyBranch(torch.nn.Module):
@@ -250,6 +263,25 @@ def test_mismatched_split_prompts_require_override(tmp_path):
         raise AssertionError("Expected mismatched prompts to fail")
 
 
+def test_view_order_is_resolved_from_both_dataset_splits(tmp_path):
+    path = tmp_path / "data.json"
+    path.write_text('{"train":{},"test":{}}', encoding="utf-8")
+    assert resolve_view_order(str(path)) == DEFAULT_VIEW_ORDER
+
+    path.write_text(
+        '{"train":{"residual_image":"train"},'
+        '"test":{"residual_image":"test"}}',
+        encoding="utf-8",
+    )
+    assert resolve_view_order(str(path)) == RESIDUAL_VIEW_ORDER
+
+    path.write_text(
+        '{"train":{"residual_image":"train"},"test":{}}', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="both define residual_image"):
+        resolve_view_order(str(path))
+
+
 def test_validation_restores_stage_specific_modes():
     model = ValidationModel()
     criterion = DummyCriterion()
@@ -257,6 +289,7 @@ def test_validation_restores_stage_specific_modes():
     conditioning[:, 1] = 1
     batch = {
         "conditioning_pixel_values": conditioning,
+        "rainy_pixel_values": torch.ones(1, 3, 16, 16),
         "target_pixel_values": torch.zeros(1, 3, 16, 16),
         "input_ids": torch.zeros(1, 77, dtype=torch.long),
     }

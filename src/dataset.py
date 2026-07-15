@@ -16,6 +16,7 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 DEFAULT_PROMPT = "remove rain streaks and restore a clean natural image"
 PRELIMINARY_VIEW_INDEX = 0
 RAINY_VIEW_INDEX = 1
+RESIDUAL_VIEW_INDEX = 1
 
 
 def _files_by_stem(directory: str | Path) -> Dict[str, Path]:
@@ -43,11 +44,12 @@ def _format_stems(stems: Iterable[str]) -> str:
 
 
 class PairedDataset(torch.utils.data.Dataset):
-    """Return aligned ``[preliminary, rainy] -> clean`` training samples.
+    """Return aligned ``[preliminary, auxiliary] -> clean`` training samples.
 
     The JSON split is directory based and contains ``image``, ``ref_image``,
-    ``target_image`` and optionally ``prompt``. Files are joined by stem, never
-    by sorted-list position.
+    ``target_image`` and optionally ``residual_image`` and ``prompt``. ``image``
+    always remains the original rainy image so validation can report its true
+    baseline. Files are joined by stem, never by sorted-list position.
     """
 
     def __init__(
@@ -88,11 +90,18 @@ class PairedDataset(torch.utils.data.Dataset):
         rainy = _files_by_stem(split_config["image"])
         preliminary = _files_by_stem(split_config["ref_image"])
         clean = _files_by_stem(split_config["target_image"])
+        residual = (
+            _files_by_stem(split_config["residual_image"])
+            if "residual_image" in split_config
+            else None
+        )
         stem_sets = {
             "image": set(rainy),
             "ref_image": set(preliminary),
             "target_image": set(clean),
         }
+        if residual is not None:
+            stem_sets["residual_image"] = set(residual)
         expected = stem_sets["image"]
         mismatches = []
         for name, stems in stem_sets.items():
@@ -105,7 +114,11 @@ class PairedDataset(torch.utils.data.Dataset):
         if mismatches:
             raise ValueError("Image stems do not match across directories; " + "; ".join(mismatches))
 
-        self.samples = [(rainy[s], preliminary[s], clean[s]) for s in sorted(expected)]
+        self.uses_residual_view = residual is not None
+        self.samples = [
+            (rainy[s], preliminary[s], clean[s], residual[s] if residual else None)
+            for s in sorted(expected)
+        ]
         self.configured_prompt = split_config.get("prompt", DEFAULT_PROMPT)
         self.prompt = prompt_override if prompt_override is not None else self.configured_prompt
         self.tokenizer = tokenizer
@@ -115,13 +128,16 @@ class PairedDataset(torch.utils.data.Dataset):
         self._validate_images()
 
     def _validate_images(self) -> None:
-        for rainy_path, preliminary_path, clean_path in self.samples:
+        for rainy_path, preliminary_path, clean_path, residual_path in self.samples:
             sizes = []
-            for role, path in (
+            paths = [
                 ("image", rainy_path),
                 ("ref_image", preliminary_path),
                 ("target_image", clean_path),
-            ):
+            ]
+            if residual_path is not None:
+                paths.append(("residual_image", residual_path))
+            for role, path in paths:
                 with Image.open(path) as image:
                     if image.mode != "RGB":
                         raise ValueError(f"{role} must be RGB, got {image.mode}: {path}")
@@ -144,30 +160,41 @@ class PairedDataset(torch.utils.data.Dataset):
             return TF.to_tensor(image)
 
     def __getitem__(self, index: int):
-        rainy_path, preliminary_path, clean_path = self.samples[index]
+        rainy_path, preliminary_path, clean_path, residual_path = self.samples[index]
         rainy = self._load(rainy_path)
         preliminary = self._load(preliminary_path)
         clean = self._load(clean_path)
+        auxiliary = self._load(residual_path) if residual_path is not None else rainy.clone()
 
         augmentation_draw = random.random()
         if augmentation_draw < self.clean_identity_prob:
             rainy = clean.clone()
             preliminary = clean.clone()
+            auxiliary = (
+                torch.full_like(auxiliary, 0.5)
+                if self.uses_residual_view
+                else clean.clone()
+            )
         elif augmentation_draw < self.clean_identity_prob + self.reference_dropout_prob:
-            preliminary = rainy.clone()
+            if self.uses_residual_view:
+                auxiliary = torch.full_like(auxiliary, 0.5)
+            else:
+                preliminary = rainy.clone()
+                auxiliary = rainy.clone()
 
         if random.random() < self.horizontal_flip_prob:
             rainy = TF.hflip(rainy)
             preliminary = TF.hflip(preliminary)
             clean = TF.hflip(clean)
+            auxiliary = TF.hflip(auxiliary)
 
-        # View 0 is the image to refine, so the supervised output is decoded
-        # from the preliminary image latent. The rainy image remains view 1 and
-        # contributes degradation evidence through the multi-view attention.
-        conditioning = torch.stack((preliminary, rainy), dim=0).mul(2.0).sub(1.0)
+        # View 0 is always the image to refine. View 1 is either the original
+        # rainy image or a centered PNG encoding of rainy - preliminary.
+        conditioning = torch.stack((preliminary, auxiliary), dim=0).mul(2.0).sub(1.0)
         target = clean.mul(2.0).sub(1.0)
         output = {
             "conditioning_pixel_values": conditioning,
+            "rainy_pixel_values": rainy.mul(2.0).sub(1.0),
             "target_pixel_values": target,
             "caption": self.prompt,
         }
