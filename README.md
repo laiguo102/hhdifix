@@ -38,6 +38,10 @@ python src/split_rain13k.py \
 `split_manifest.csv` 和含实际数量、背景组数量及泄漏检查结果的 `split_summary.json`。重新生成时必须
 显式添加 `--overwrite`。
 
+服务器端统一尺寸使用 `output/jupyter-notebook/prepare_rain13k_512.ipynb`。该 notebook 沿用
+`degradation_test.ipynb` 的中心正方形裁剪和 LANCZOS 缩放方法，但会对 rainy/clean 配对图像使用
+同一裁剪框，输出到新的 `Rain13K_512` 目录，并可按划分清单创建零拷贝硬链接训练视图。
+
 三个目录必须具有完全相同的文件 stem；扩展名可以不同。每张图必须是 RGB
 512×512。复制 `data/derain.example.json` 为 `data/derain.json` 并填写路径：
 
