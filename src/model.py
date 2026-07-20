@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, CLIPTextModel
 
 BASE_MODEL = "stabilityai/sd-turbo"
 DEFAULT_PROMPT = "remove rain streaks and restore a clean natural image"
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 DEFAULT_VIEW_ORDER = "preliminary_rainy"
 LEGACY_VIEW_ORDER = "rainy_preliminary"
 RESIDUAL_VIEW_ORDER = "preliminary_residual"
@@ -31,6 +31,92 @@ VAE_DECODER_LORA_SUFFIXES = [
     "conv1", "conv2", "conv_in", "conv_shortcut", "conv", "conv_out",
     "to_k", "to_q", "to_v", "to_out.0",
 ]
+VAE_SKIP_NAMES = (
+    "skip_conv_1",
+    "skip_conv_2",
+    "skip_conv_3",
+    "skip_conv_4",
+)
+
+
+def _vae_encoder_forward_with_skips(self, sample: torch.Tensor) -> torch.Tensor:
+    """Run the frozen VAE encoder and retain multi-scale features for decoding."""
+    sample = self.conv_in(sample)
+    down_block_features = []
+    for down_block in self.down_blocks:
+        down_block_features.append(sample)
+        sample = down_block(sample)
+    sample = self.mid_block(sample)
+    sample = self.conv_norm_out(sample)
+    sample = self.conv_act(sample)
+    sample = self.conv_out(sample)
+    self.current_down_blocks = tuple(down_block_features)
+    return sample
+
+
+def _vae_decoder_forward_with_skips(
+    self,
+    sample: torch.Tensor,
+    latent_embeds: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Decode latents while injecting the matching frozen encoder features."""
+    sample = self.conv_in(sample)
+    upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
+    sample = self.mid_block(sample, latent_embeds)
+    sample = sample.to(upscale_dtype)
+
+    incoming = getattr(self, "incoming_skip_acts", None)
+    if incoming is None or len(incoming) != len(VAE_SKIP_NAMES):
+        raise RuntimeError(
+            "VAE decoder requires four encoder skip activations; call vae.encode() "
+            "on the same input batch before vae.decode()"
+        )
+    skip_convs = tuple(getattr(self, name) for name in VAE_SKIP_NAMES)
+    for up_block, skip_conv, skip_activation in zip(
+        self.up_blocks, skip_convs, reversed(incoming)
+    ):
+        sample = sample + skip_conv(skip_activation.to(upscale_dtype))
+        sample = up_block(sample, latent_embeds)
+
+    if latent_embeds is None:
+        sample = self.conv_norm_out(sample)
+    else:
+        sample = self.conv_norm_out(sample, latent_embeds)
+    sample = self.conv_act(sample)
+    return self.conv_out(sample)
+
+
+def _vae_skip_state(vae: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    decoder = getattr(vae, "decoder", None)
+    if decoder is None:
+        return {}
+    return {
+        name: getattr(decoder, name).weight.detach().cpu().clone()
+        for name in VAE_SKIP_NAMES
+        if hasattr(decoder, name)
+    }
+
+
+def _load_vae_skip_state(vae: torch.nn.Module, state: Dict[str, torch.Tensor]) -> None:
+    decoder = getattr(vae, "decoder", None)
+    expected = {
+        name for name in VAE_SKIP_NAMES
+        if decoder is not None and hasattr(decoder, name)
+    }
+    if set(state) != expected:
+        raise ValueError(
+            f"Checkpoint VAE skip modules differ: checkpoint={sorted(state)}, "
+            f"model={sorted(expected)}"
+        )
+    with torch.no_grad():
+        for name, weight in state.items():
+            module = getattr(decoder, name)
+            if module.weight.shape != weight.shape:
+                raise ValueError(
+                    f"Checkpoint {name} shape={tuple(weight.shape)}, "
+                    f"model expects {tuple(module.weight.shape)}"
+                )
+            module.weight.copy_(weight.to(module.weight.device, module.weight.dtype))
 
 
 def _lora_state(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -73,6 +159,24 @@ class Difix(torch.nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(base_model, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
         self.vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae")
+        self.vae.encoder.forward = _vae_encoder_forward_with_skips.__get__(
+            self.vae.encoder, self.vae.encoder.__class__
+        )
+        self.vae.decoder.forward = _vae_decoder_forward_with_skips.__get__(
+            self.vae.decoder, self.vae.decoder.__class__
+        )
+        skip_channels = (
+            (512, 512),
+            (256, 512),
+            (128, 512),
+            (128, 256),
+        )
+        for name, (in_channels, out_channels) in zip(VAE_SKIP_NAMES, skip_channels):
+            skip_conv = torch.nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, bias=False
+            )
+            torch.nn.init.zeros_(skip_conv.weight)
+            setattr(self.vae.decoder, name, skip_conv)
         try:
             from mv_unet import UNet2DConditionModel
         except ImportError:  # package-style imports used by tests and notebooks
@@ -125,7 +229,12 @@ class Difix(torch.nn.Module):
         for name, parameter in self.unet.named_parameters():
             parameter.requires_grad_("lora_" in name)
         for name, parameter in self.vae.named_parameters():
-            parameter.requires_grad_(stage == "B" and "lora_" in name and "decoder" in name)
+            is_decoder_lora = "lora_" in name and "decoder" in name
+            is_skip_conv = any(
+                name.startswith(f"decoder.{skip_name}.")
+                for skip_name in VAE_SKIP_NAMES
+            )
+            parameter.requires_grad_(stage == "B" and (is_decoder_lora or is_skip_conv))
         self.text_encoder.requires_grad_(False)
 
     def trainable_parameter_groups(self, unet_lr: float, vae_lr: float):
@@ -133,15 +242,15 @@ class Difix(torch.nn.Module):
         vae = [p for p in self.vae.parameters() if p.requires_grad]
         groups = [{"params": unet, "lr": unet_lr, "name": "unet_lora"}]
         if vae:
-            groups.append({"params": vae, "lr": vae_lr, "name": "vae_decoder_lora"})
+            groups.append({"params": vae, "lr": vae_lr, "name": "vae_decoder_lora_skip"})
         if not unet or any(not p.requires_grad for group in groups for p in group["params"]):
-            raise RuntimeError("Optimizer groups must contain only trainable LoRA parameters")
+            raise RuntimeError("Optimizer groups must contain only trainable parameters")
         return groups
 
-    def trainable_vae_lora_parameters(self):
+    def trainable_vae_parameters(self):
         return [
-            parameter for name, parameter in self.vae.named_parameters()
-            if parameter.requires_grad and "lora_" in name and "decoder" in name
+            parameter for parameter in self.vae.parameters()
+            if parameter.requires_grad
         ]
 
     def _prompt_embeddings(self, prompt_tokens: torch.Tensor, views: int):
@@ -187,7 +296,17 @@ class Difix(torch.nn.Module):
             prediction = unconditional + cfg_scale * (conditional - unconditional)
 
         denoised = self.scheduler.step(prediction, timestep, latents, return_dict=True).prev_sample
-        decoded = self.vae.decode(denoised / self.vae.config.scaling_factor).sample.clamp(-1, 1)
+        skip_activations = getattr(self.vae.encoder, "current_down_blocks", None)
+        if skip_activations is None:
+            raise RuntimeError("VAE encoder did not produce skip activations")
+        self.vae.decoder.incoming_skip_acts = skip_activations
+        try:
+            decoded = self.vae.decode(
+                denoised / self.vae.config.scaling_factor
+            ).sample.clamp(-1, 1)
+        finally:
+            self.vae.decoder.incoming_skip_acts = None
+            self.vae.encoder.current_down_blocks = None
         return rearrange(decoded, "(b v) c h w -> b v c h w", b=batch, v=views)
 
     @torch.no_grad()
@@ -249,6 +368,7 @@ class Difix(torch.nn.Module):
             "prompt": self.prompt,
             "cfg_scale": self.cfg_scale,
             "view_order": self.view_order,
+            "vae_skip": True,
             "stage": self.stage,
         }
 
@@ -287,6 +407,7 @@ def save_checkpoint(
         "training_state": state,
         "unet_lora": _lora_state(model.unet),
         "vae_decoder_lora": _lora_state(model.vae),
+        "vae_skip": _vae_skip_state(model.vae),
     }
     if checkpoint_kind == "training":
         payload["optimizer"] = optimizer.state_dict()
@@ -318,13 +439,16 @@ def load_checkpoint(
 ) -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location="cpu")
     if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-        raise ValueError("Only checkpoint schema v2 is supported")
+        raise ValueError(
+            f"Only checkpoint schema v{CHECKPOINT_SCHEMA_VERSION} is supported; "
+            "VAE skip connections require a new training run"
+        )
     config = checkpoint["config"]
     expected = model.checkpoint_config()
     saved_config = {**config, "view_order": config.get("view_order", LEGACY_VIEW_ORDER)}
     for key in (
         "base_model", "num_views", "lora_rank_unet", "lora_rank_vae",
-        "timestep", "prompt", "cfg_scale", "view_order",
+        "timestep", "prompt", "cfg_scale", "view_order", "vae_skip",
     ):
         if saved_config[key] != expected[key]:
             raise ValueError(
@@ -333,6 +457,7 @@ def load_checkpoint(
     model.set_stage(config.get("stage", "A"))
     _load_lora_state(model.unet, checkpoint["unet_lora"])
     _load_lora_state(model.vae, checkpoint["vae_decoder_lora"])
+    _load_vae_skip_state(model.vae, checkpoint["vae_skip"])
     if optimizer is not None:
         if checkpoint["checkpoint_kind"] != "training":
             raise ValueError("A weights-only checkpoint cannot resume optimizer state")

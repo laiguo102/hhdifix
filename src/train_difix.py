@@ -143,7 +143,7 @@ def _base_optimizer(optimizer):
 
 
 def transition_to_stage_b(model: Difix, optimizer, args):
-    """Enable VAE LoRA without replacing optimizer or UNet Adam state."""
+    """Enable VAE decoder LoRA and skip convs without replacing Adam state."""
     if model.stage != "A":
         raise ValueError(f"Can only transition from stage A, got {model.stage}")
     base_optimizer = _base_optimizer(optimizer)
@@ -153,11 +153,11 @@ def transition_to_stage_b(model: Difix, optimizer, args):
     existing = {id(parameter) for group in base_optimizer.param_groups for parameter in group["params"]}
 
     model.set_stage("B")
-    vae_parameters = model.trainable_vae_lora_parameters()
+    vae_parameters = model.trainable_vae_parameters()
     if not vae_parameters:
-        raise RuntimeError("No trainable VAE decoder LoRA parameters at stage-B transition")
+        raise RuntimeError("No trainable VAE decoder/skip parameters at stage-B transition")
     if any(id(parameter) in existing for parameter in vae_parameters):
-        raise RuntimeError("VAE LoRA parameters are already present in the optimizer")
+        raise RuntimeError("VAE decoder/skip parameters are already present in the optimizer")
 
     base_optimizer.param_groups[0]["lr"] = args.stage_b_unet_lr
     base_optimizer.param_groups[0]["initial_lr"] = args.stage_b_unet_lr
@@ -165,7 +165,7 @@ def transition_to_stage_b(model: Difix, optimizer, args):
         "params": vae_parameters,
         "lr": args.vae_lr,
         "initial_lr": args.vae_lr,
-        "name": "vae_decoder_lora",
+        "name": "vae_decoder_lora_skip",
     })
     for parameter, state in base_optimizer.state.items():
         if id(parameter) in unet_state_ids and state is not unet_state_ids[id(parameter)]:
@@ -325,7 +325,11 @@ def main(args):
         for key in ("stage_a_steps", "stage_b_steps"):
             if int(saved_state[key]) != int(getattr(args, key)):
                 raise ValueError(f"Checkpoint {key}={saved_state[key]} differs from requested {getattr(args, key)}")
-        expected_groups = ["unet_lora"] if saved_state["stage"] == "A" else ["unet_lora", "vae_decoder_lora"]
+        expected_groups = (
+            ["unet_lora"]
+            if saved_state["stage"] == "A"
+            else ["unet_lora", "vae_decoder_lora_skip"]
+        )
         if saved_state["optimizer_groups"] != expected_groups:
             raise ValueError(
                 f"Checkpoint stage/group mismatch: stage={saved_state['stage']}, "

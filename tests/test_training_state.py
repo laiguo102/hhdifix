@@ -7,6 +7,9 @@ import torch
 from src.model import (
     DEFAULT_VIEW_ORDER,
     RESIDUAL_VIEW_ORDER,
+    VAE_SKIP_NAMES,
+    _vae_decoder_forward_with_skips,
+    _vae_encoder_forward_with_skips,
     load_checkpoint,
     read_checkpoint_metadata,
     save_checkpoint,
@@ -27,11 +30,22 @@ class TinyBranch(torch.nn.Module):
         self.lora_weight = torch.nn.Parameter(torch.tensor([1.0]))
 
 
+class TinyVAE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lora_weight = torch.nn.Parameter(torch.tensor([1.0]))
+        self.decoder = torch.nn.Module()
+        for index in range(1, 5):
+            skip_conv = torch.nn.Conv2d(1, 1, kernel_size=1, bias=False)
+            torch.nn.init.zeros_(skip_conv.weight)
+            setattr(self.decoder, f"skip_conv_{index}", skip_conv)
+
+
 class TinyDifix(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.unet = TinyBranch()
-        self.vae = TinyBranch()
+        self.vae = TinyVAE()
         self.stage = "A"
         self.set_stage("A")
 
@@ -39,9 +53,10 @@ class TinyDifix(torch.nn.Module):
         self.stage = stage
         self.unet.lora_weight.requires_grad_(True)
         self.vae.lora_weight.requires_grad_(stage == "B")
+        self.vae.decoder.requires_grad_(stage == "B")
 
-    def trainable_vae_lora_parameters(self):
-        return [self.vae.lora_weight] if self.vae.lora_weight.requires_grad else []
+    def trainable_vae_parameters(self):
+        return [parameter for parameter in self.vae.parameters() if parameter.requires_grad]
 
     def checkpoint_config(self):
         return {
@@ -53,6 +68,7 @@ class TinyDifix(torch.nn.Module):
             "prompt": "derain",
             "cfg_scale": 1.0,
             "view_order": "preliminary_rainy",
+            "vae_skip": True,
             "stage": self.stage,
         }
 
@@ -60,6 +76,20 @@ class TinyDifix(torch.nn.Module):
 class DummyLPIPS(torch.nn.Module):
     def forward(self, prediction, target):
         return (prediction - target).abs().flatten(1).mean(1).view(-1, 1, 1, 1)
+
+
+class AddOne(torch.nn.Module):
+    def forward(self, sample, *_args):
+        return sample + 1
+
+
+class PassThroughBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dtype_anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, sample, *_args):
+        return sample
 
 
 class DummyCriterion(torch.nn.Module):
@@ -123,6 +153,40 @@ def _initialize_adam_state(model, optimizer):
     optimizer.zero_grad(set_to_none=True)
 
 
+def test_vae_skip_forward_caches_and_injects_features_in_reverse_order():
+    encoder = torch.nn.Module()
+    encoder.conv_in = torch.nn.Identity()
+    encoder.down_blocks = torch.nn.ModuleList([AddOne() for _ in VAE_SKIP_NAMES])
+    encoder.mid_block = torch.nn.Identity()
+    encoder.conv_norm_out = torch.nn.Identity()
+    encoder.conv_act = torch.nn.Identity()
+    encoder.conv_out = torch.nn.Identity()
+    encoded = _vae_encoder_forward_with_skips(encoder, torch.zeros(1, 1, 2, 2))
+
+    assert torch.equal(encoded, torch.full_like(encoded, 4))
+    assert [activation[0, 0, 0, 0].item() for activation in encoder.current_down_blocks] == [
+        0, 1, 2, 3,
+    ]
+
+    decoder = torch.nn.Module()
+    decoder.conv_in = torch.nn.Identity()
+    decoder.mid_block = PassThroughBlock()
+    decoder.up_blocks = torch.nn.ModuleList([PassThroughBlock() for _ in VAE_SKIP_NAMES])
+    decoder.conv_norm_out = PassThroughBlock()
+    decoder.conv_act = torch.nn.Identity()
+    decoder.conv_out = torch.nn.Identity()
+    decoder.incoming_skip_acts = encoder.current_down_blocks
+    for index, name in enumerate(VAE_SKIP_NAMES, start=1):
+        skip_conv = torch.nn.Conv2d(1, 1, kernel_size=1, bias=False)
+        with torch.no_grad():
+            skip_conv.weight.fill_(index)
+        setattr(decoder, name, skip_conv)
+
+    decoded = _vae_decoder_forward_with_skips(decoder, torch.zeros(1, 1, 2, 2))
+    # Reversed encoder values [3, 2, 1, 0] use skip weights [1, 2, 3, 4].
+    assert torch.equal(decoded, torch.full_like(decoded, 10))
+
+
 def test_stage_b_transition_preserves_unet_adam_state():
     model = TinyDifix()
     optimizer = _stage_a_optimizer(model)
@@ -133,11 +197,16 @@ def test_stage_b_transition_preserves_unet_adam_state():
     returned = transition_to_stage_b(model, optimizer, _args())
 
     assert id(returned) == optimizer_id
-    assert [group["name"] for group in optimizer.param_groups] == ["unet_lora", "vae_decoder_lora"]
+    assert [group["name"] for group in optimizer.param_groups] == [
+        "unet_lora", "vae_decoder_lora_skip",
+    ]
     assert optimizer.param_groups[0]["lr"] == 1e-5
     assert optimizer.param_groups[1]["lr"] == 1e-5
     assert torch.equal(optimizer.state[model.unet.lora_weight]["exp_avg"], exp_avg)
     assert model.vae.lora_weight not in optimizer.state
+    assert {id(parameter) for parameter in optimizer.param_groups[1]["params"]} == {
+        id(parameter) for parameter in model.vae.parameters() if parameter.requires_grad
+    }
 
 
 def test_stage_a_checkpoint_roundtrip_and_boundary_resume(tmp_path):
@@ -161,7 +230,9 @@ def test_stage_a_checkpoint_roundtrip_and_boundary_resume(tmp_path):
     assert torch.equal(restored.unet.lora_weight, model.unet.lora_weight)
     transition_to_stage_b(restored, restored_optimizer, _args())
     assert restored.stage == "B"
-    assert [group["name"] for group in restored_optimizer.param_groups] == ["unet_lora", "vae_decoder_lora"]
+    assert [group["name"] for group in restored_optimizer.param_groups] == [
+        "unet_lora", "vae_decoder_lora_skip",
+    ]
     assert restored_optimizer.state[restored.unet.lora_weight]["step"].item() == 1
 
     stage_b_scheduler = torch.optim.lr_scheduler.LambdaLR(restored_optimizer, lambda _step: 1.0)
@@ -174,7 +245,11 @@ def test_stage_a_checkpoint_roundtrip_and_boundary_resume(tmp_path):
     stage_b_restored.set_stage("B")
     stage_b_optimizer = torch.optim.AdamW([
         {"params": [stage_b_restored.unet.lora_weight], "lr": 1e-5, "name": "unet_lora"},
-        {"params": [stage_b_restored.vae.lora_weight], "lr": 1e-5, "name": "vae_decoder_lora"},
+        {
+            "params": stage_b_restored.trainable_vae_parameters(),
+            "lr": 1e-5,
+            "name": "vae_decoder_lora_skip",
+        },
     ])
     stage_b_scheduler_restored = torch.optim.lr_scheduler.LambdaLR(stage_b_optimizer, lambda _step: 1.0)
     stage_b_state = load_checkpoint(
@@ -194,6 +269,8 @@ def test_weights_checkpoint_has_no_optimizer(tmp_path):
     assert metadata["checkpoint_kind"] == "weights"
     assert "optimizer" not in payload
     assert "scheduler" not in payload
+    assert payload["config"]["vae_skip"] is True
+    assert sorted(payload["vae_skip"]) == [f"skip_conv_{index}" for index in range(1, 5)]
 
 
 def test_legacy_view_order_checkpoint_cannot_resume_new_training(tmp_path):

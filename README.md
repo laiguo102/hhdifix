@@ -129,7 +129,7 @@ accelerate launch --mixed_precision=bf16 src/train_difix.py \
 默认有效 batch size 为 8。训练分为：
 
 - 阶段 A：15,000 steps，仅 UNet LoRA rank 16，LR `5e-5`，warmup 500
-- 阶段 B：5,000 steps，UNet LR `1e-5`，启用 VAE decoder LoRA rank 4，LR `1e-5`
+- 阶段 B：5,000 steps，UNet LR `1e-5`，启用 VAE decoder LoRA rank 4 和四层 encoder→decoder skip 1×1 卷积，LR `1e-5`
 
 固定 `timestep=199`、`CFG=1.0`、prompt dropout 关闭、gradient clip 1.0。
 损失为：
@@ -139,10 +139,11 @@ Charbonnier + 0.2 SSIM + 0.1 LPIPS + 0.05 Sobel
 ```
 
 阶段 A 结束时先保存 `stage-a-final.pt`，然后在原 AdamW 上降低 UNet LR 并通过
-`add_param_group()` 加入 VAE decoder LoRA，因此 UNet Adam 动量会保留。checkpoint
-使用 v2 schema：`checkpoints/resume/checkpoint-*.pt` 保存 LoRA、optimizer、scheduler、
+`add_param_group()` 加入 VAE decoder LoRA 和 skip 卷积，因此 UNet Adam 动量会保留。skip 卷积以零权重初始化，
+在阶段 A 不改变原始 VAE 输出，阶段 B 才参与训练。checkpoint 使用 v3 schema：
+`checkpoints/resume/checkpoint-*.pt` 保存 LoRA、skip 权重、optimizer、scheduler、
 阶段和 global step，自动只保留最近 5 个；`best.pt` 和 `final.pt` 是不含 optimizer 的
-轻量推理权重。所有 checkpoint 都不保存完整 SD-Turbo 权重。
+轻量推理权重。所有 checkpoint 都不保存完整 SD-Turbo 权重。由于 v2 checkpoint 不含 skip 权重，不能直接用于 v3 恢复训练或推理。
 
 ### 续训
 

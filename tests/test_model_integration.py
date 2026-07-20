@@ -15,7 +15,7 @@ if os.environ.get("HHDIFIX_RUN_GPU_TESTS") != "1":
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required", allow_module_level=True)
 
-from src.model import Difix, model_from_checkpoint, save_checkpoint
+from src.model import Difix, VAE_SKIP_NAMES, model_from_checkpoint, save_checkpoint
 
 
 def _tokens(model, batch=1):
@@ -44,10 +44,16 @@ def test_stage_a_and_b_trainable_parameters(model):
     model.set_stage("A")
     assert any(p.requires_grad for p in model.unet.parameters())
     assert not any(p.requires_grad for p in model.vae.parameters())
+    for name in VAE_SKIP_NAMES:
+        assert torch.count_nonzero(getattr(model.vae.decoder, name).weight) == 0
     model.set_stage("B")
     assert any(p.requires_grad for p in model.unet.parameters())
     assert any(p.requires_grad for p in model.vae.decoder.parameters())
     assert not any(p.requires_grad for p in model.vae.encoder.parameters())
+    assert all(
+        getattr(model.vae.decoder, name).weight.requires_grad
+        for name in VAE_SKIP_NAMES
+    )
 
 
 def test_wrong_view_shape_fails(model):
