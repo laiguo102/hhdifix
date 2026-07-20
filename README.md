@@ -22,6 +22,22 @@ pip install -r requirements.txt
 
 ## 数据
 
+### Rain13K 的 UNet/DiFix 分组划分
+
+`src/split_rain13k.py` 按清晰目标图像文件的 SHA-256 分组，保证同一背景的不同雨纹版本不会跨越
+UNet、DiFix 和验证子集。默认使用固定种子 3407 和 60%/30%/10% 比例，只生成清单，不移动或
+复制原图：
+
+```bash
+python src/split_rain13k.py \
+  --dataset_root /data/Rain13K/train/Rain13K \
+  --output_dir /data/Rain13K/splits
+```
+
+输出包括 `unet_train.txt`、`difix_train.txt`、`validation.txt`、逐样本
+`split_manifest.csv` 和含实际数量、背景组数量及泄漏检查结果的 `split_summary.json`。重新生成时必须
+显式添加 `--overwrite`。
+
 三个目录必须具有完全相同的文件 stem；扩展名可以不同。每张图必须是 RGB
 512×512。复制 `data/derain.example.json` 为 `data/derain.json` 并填写路径：
 
