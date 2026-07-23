@@ -4,11 +4,12 @@ hhDifix 使用原始雨图 `R` 和冻结的初步去雨模型离线生成图 `P`
 SD-Turbo/Difix 联合 attention 输出最终干净图：
 
 ```text
-[preliminary P, signed residual (R-P)] + prompt -> two-view Difix -> clean GT
+[view0: preliminary background P, view1: original rainy R] + prompt
+                         -> two-view DiFix -> clean GT
 ```
 
-主任务固定使用已对齐的 RGB 512×512 图像。项目不负责训练或调用初步去雨
-UNet，也不会在训练过程中读取验证/测试 GT 来生成 `P`。
+主任务固定使用已对齐的 RGB 512×512 图像。`P` 必须在 DiFix 训练前由冻结的
+UNet 离线生成；生成过程只读取雨图 `R`，不会使用该子集的 GT。
 
 ## 安装
 
@@ -42,6 +43,53 @@ python src/split_rain13k.py \
 `degradation_test.ipynb` 的中心正方形裁剪和 LANCZOS 缩放方法，但会对 rainy/clean 配对图像使用
 同一裁剪框，输出到新的 `Rain13K_512` 目录，并可按划分清单创建零拷贝硬链接训练视图。
 
+当前服务器先只对 DiFix 训练子集建立独立视图。根据固定划分，
+`difix_train.txt` 包含 4,113 张图：
+
+```bash
+cd /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/diff/hhdifix
+
+python src/materialize_rain13k_views.py \
+  --processed_root /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/Rain13K/train/Rain13K_512 \
+  --split_dir /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/Rain13K/splits \
+  --output_root /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/Rain13K/views_512 \
+  --splits difix_train
+```
+
+默认使用硬链接，不重复占用图像空间；跨文件系统时添加 `--mode copy`。随后使用已经保存的
+DCNv4 UNet 权重为这 4,113 张雨图生成同名 background PNG。专用脚本直接读取平铺的
+`difix_train/input`，不调用 UNet 项目的旧 Dataset，也不会读取 `target`：
+
+```bash
+python src/generate_difix_background.py \
+  --unet_root /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/DCNv4/general_decomp \
+  --checkpoint /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/DCNv4/general_decomp/checkpoints/rain13k_unet_dcnv4_bg0722_retrain/best.pth \
+  --input_dir /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/Rain13K/views_512/difix_train/input \
+  --output_dir /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/Rain13K/views_512/difix_train/background \
+  --expected_count 4113 \
+  --batch_size 4 \
+  --num_workers 4 \
+  --device cuda
+```
+
+脚本默认使用 FP32，与原 UNet 推理路径一致。显存不足时先将 `--batch_size` 降为 2 或 1。
+任务中断后用完全相同的命令加 `--resume`；脚本会验证并跳过已完成的同名 RGB PNG。
+成功结束时会再次检查 `input` 与 `background` 是否都是完全相同的 4,113 个 stem。
+
+验证集目录已经存在，可在开始 DiFix 验证前用同一脚本生成 background：
+
+```bash
+python src/generate_difix_background.py \
+  --unet_root /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/DCNv4/general_decomp \
+  --checkpoint /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/DCNv4/general_decomp/checkpoints/rain13k_unet_dcnv4_bg0722_retrain/best.pth \
+  --input_dir /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/Rain13K/views_512/validation/input \
+  --output_dir /home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/Rain13K/views_512/validation/background \
+  --expected_count 1371 \
+  --batch_size 4 \
+  --num_workers 4 \
+  --device cuda
+```
+
 三个目录必须具有完全相同的文件 stem；扩展名可以不同。每张图必须是 RGB
 512×512。复制 `data/derain.example.json` 为 `data/derain.json` 并填写路径：
 
@@ -50,14 +98,12 @@ python src/split_rain13k.py \
   "train": {
     "image": "/data/train/rainy",
     "ref_image": "/data/train/preliminary",
-    "residual_image": "/data/train/rain-minus-preliminary",
     "target_image": "/data/train/gt",
     "prompt": "remove rain streaks and restore a clean natural image"
   },
   "test": {
     "image": "/data/test/rainy",
     "ref_image": "/data/test/preliminary",
-    "residual_image": "/data/test/rain-minus-preliminary",
     "target_image": "/data/test/gt",
     "prompt": "remove rain streaks and restore a clean natural image"
   }
@@ -66,18 +112,17 @@ python src/split_rain13k.py \
 
 Dataset 输出：
 
-- `conditioning_pixel_values`: `[2,3,512,512]`，顺序 `[P,R-P]`，范围 `[-1,1]`
+- `conditioning_pixel_values`: `[2,3,512,512]`，顺序 `[P,R]`，范围 `[-1,1]`
 - `rainy_pixel_values`: `[3,512,512]`，仅用于报告原始雨图验证指标
 - `target_pixel_values`: `[3,512,512]`，仅 GT，范围 `[-1,1]`
 - `input_ids`: `[77]`
 
-模型固定监督并输出 view 0，因此最终图像从 preliminary 的 latent 开始精修；有符号
-雨残差作为 view 1，通过双视图 attention 提供退化线索。checkpoint 保存
-`view_order=preliminary_residual`，不能从 `[R,P]` 或 `[P,R]` checkpoint 恢复训练。
-如果配置省略 `residual_image`，代码仍支持原来的 `[P,R]` 模式。
+模型固定监督并输出 view 0，因此最终图像从 preliminary background 的 latent 开始精修；
+原始退化雨图作为 view 1，通过双视图 attention 提供雨纹和内容线索。checkpoint 保存
+`view_order=preliminary_rainy`，不能与 `[P,R-P]` checkpoint 混用或相互恢复训练。
 
-默认增强为所有配对图同步水平翻转、20% residual dropout
-（`[P,0] -> GT`）和 10% clean identity（`[GT,0] -> GT`）。不进行 resize、
+默认增强为所有配对图同步水平翻转、20% reference dropout
+（`[R,R] -> GT`）和 10% clean identity（`[GT,GT] -> GT`）。不进行 resize、
 旋转、噪声合成或颜色抖动。
 
 ### 生成有符号雨残差视图
@@ -117,8 +162,8 @@ bash src/train_singlegpu.sh
 
 ```bash
 accelerate launch --mixed_precision=bf16 src/train_difix.py \
-  --dataset_path data/derain.json \
-  --output_dir outputs/hhdifix-residual \
+  --dataset_path /data/Rain13K/derain.json \
+  --output_dir outputs/hhdifix-rainy \
   --train_batch_size 2 \
   --gradient_accumulation_steps 4 \
   --checkpointing_steps 500 \
@@ -151,9 +196,9 @@ Charbonnier + 0.2 SSIM + 0.1 LPIPS + 0.05 Sobel
 
 ```bash
 accelerate launch --mixed_precision=bf16 src/train_difix.py \
-  --dataset_path data/derain.json \
-  --output_dir outputs/hhdifix-residual \
-  --resume outputs/hhdifix-residual/checkpoints
+  --dataset_path /data/Rain13K/derain.json \
+  --output_dir outputs/hhdifix-rainy \
+  --resume outputs/hhdifix-rainy/checkpoints
 ```
 
 目录恢复会从 `checkpoints/resume/` 选择数字最大的 checkpoint。也可以显式从
@@ -166,8 +211,8 @@ accelerate launch --mixed_precision=bf16 src/train_difix.py \
 python src/inference_difix.py \
   --rainy_dir /data/test/rainy \
   --preliminary_dir /data/test/preliminary \
-  --checkpoint outputs/hhdifix-residual/checkpoints/final.pt \
-  --output_dir outputs/hhdifix-residual/results
+  --checkpoint outputs/hhdifix-rainy/checkpoints/final.pt \
+  --output_dir outputs/hhdifix-rainy/results
 ```
 
 推理严格按 stem 配对并检查同尺寸，使用 VAE posterior `mode()`，因此固定权重和
@@ -179,9 +224,9 @@ python src/inference_difix.py \
 python src/evaluate_img.py \
   --rainy_dir /data/test/rainy \
   --preliminary_dir /data/test/preliminary \
-  --final_dir outputs/hhdifix-residual/results \
+  --final_dir outputs/hhdifix-rainy/results \
   --gt_dir /data/test/gt \
-  --output outputs/hhdifix-residual/metrics.json
+  --output outputs/hhdifix-rainy/metrics.json
 ```
 
 训练期 validation 和独立评测都会报告 Rainy、Preliminary、Final 各自的

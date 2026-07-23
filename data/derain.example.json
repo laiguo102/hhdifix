@@ -1,16 +1,14 @@
 {
   "train": {
-    "image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/rain",
-    "ref_image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/images5000_2_background",
-    "residual_image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/rain_minus_background",
-    "target_image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/gt",
+    "image": "/data/views_512/difix_train/input",
+    "ref_image": "/data/views_512/difix_train/background",
+    "target_image": "/data/views_512/difix_train/target",
     "prompt": "remove rain streaks and restore a clean natural image"
   },
   "test": {
-    "image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/valid/rain",
-    "ref_image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/valid/background",
-    "residual_image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/valid/rain_minus_background",
-    "target_image": "/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/data/images5000_2/valid/gt",
+    "image": "/data/views_512/validation/input",
+    "ref_image": "/data/views_512/validation/background",
+    "target_image": "/data/views_512/validation/target",
     "prompt": "remove rain streaks and restore a clean natural image"
   }
 }
